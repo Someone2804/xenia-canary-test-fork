@@ -41,6 +41,17 @@ namespace d3d12 {
 class D3D12CommandProcessor;
 
 class D3D12RenderTargetCache final : public RenderTargetCache {
+
+ public:
+   // Return shared state for a morph HostSurface resource if tracked.
+   D3D12_RESOURCE_STATES* GetMorphSharedStateForResource(ID3D12Resource* res) const {
+     auto it = morph_state_by_res_.find(res);
+     return it == morph_state_by_res_.end() ? nullptr : it->second;
+   }
+
+ private:
+   // HostSurface.resource -> shared_state*
+   std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES*> morph_state_by_res_;
  public:
   D3D12RenderTargetCache(const RegisterFile& register_file,
                          const Memory& memory, TraceWriter& trace_writer,

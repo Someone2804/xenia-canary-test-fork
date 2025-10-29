@@ -1533,17 +1533,17 @@ void D3D12RenderTargetCache::TransitionRenderTargetToState(
     D3D12RenderTarget& render_target,
     D3D12_RESOURCE_STATES new_state) {
 
-    if (rt.is_morph_host_surface()) {
-        D3D12_RESOURCE_STATES* shared = rt.morph_shared_state();
-        D3D12_RESOURCE_STATES old_state =
-            shared ? *shared : D3D12_RESOURCE_STATE_COMMON;
-        if (old_state != new_state) {
-          command_processor_.PushTransitionBarrier(res, old_state, new_state);
-          // Здесь НЕ откладываем на потом: этот helper традиционно сразу пушит,
-          // а call site позже делает SubmitBarriers().
-          if (shared) *shared = new_state;
+    ID3D12Resource* res = render_target.resource();
+      if (res) {
+        if (auto* shared = GetMorphSharedStateForResource(res)) {
+          D3D12_RESOURCE_STATES old_state =
+              *shared ? *shared : D3D12_RESOURCE_STATE_COMMON;
+          if (old_state != new_state) {
+            command_processor_.PushTransitionBarrier(res, old_state, new_state);
+            *shared = new_state;
+          }
+          return;
         }
-        return;
       }
 
   D3D12_RESOURCE_STATES old_state = render_target.SetResourceState(new_state);
@@ -2117,6 +2117,9 @@ bool D3D12RenderTargetCache::EnsureHostSurfaceForTexture(
       TransitionRenderTargetToState(*surface->render_target, required_state);
       command_processor_.SubmitBarriers();
     }
+  }
+  if (resource_out && shared_state_out) {
+    morph_state_by_res_[resource_out] = shared_state_out;
   }
   return resource_out != nullptr;
 }
