@@ -155,6 +155,14 @@ class VulkanTextureCache final : public TextureCache {
     return nullptr;
   }
 
+  uint64_t GetScaledResolveCurrentRangeStartScaled() const {
+    return scaled_resolve_current_range_start_scaled_;
+  }
+
+  uint64_t GetScaledResolveCurrentRangeLengthScaled() const {
+    return scaled_resolve_current_range_length_scaled_;
+  }
+
  protected:
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;

@@ -1116,7 +1116,8 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             // Ensure scaled resolve memory is committed
             scaled_buffer_ready = true;
             if (!texture_cache.EnsureScaledResolveMemoryCommittedPublic(
-                    dest_address, dest_length)) {
+                    dest_address, dest_length,
+                    copy_shader_info.dest_bpe_log2)) {
               XELOGE(
                   "Failed to commit scaled resolve memory for resolve dest at "
                   "0x{:08X}",
@@ -1127,7 +1128,9 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             // Make the range current to get the buffer
             if (scaled_buffer_ready &&
                 !texture_cache.MakeScaledResolveRangeCurrent(dest_address,
-                                                             dest_length)) {
+                                                             dest_length,
+                                                             copy_shader_info
+                                                                 .dest_bpe_log2)) {
               XELOGE(
                   "Failed to make scaled resolve range current for resolve "
                   "dest at 0x{:08X}",
@@ -1150,27 +1153,64 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
 
             if (scaled_buffer_ready) {
               // Calculate offset within the scaled buffer
-              uint32_t draw_resolution_scale_area =
-                  draw_resolution_scale_x() * draw_resolution_scale_y();
-              uint64_t scaled_offset =
-                  uint64_t(dest_address) * draw_resolution_scale_area;
+              const uint64_t range_start_scaled =
+                  texture_cache.GetScaledResolveCurrentRangeStartScaled();
+              const uint64_t range_length_scaled =
+                  texture_cache.GetScaledResolveCurrentRangeLengthScaled();
+              if (!range_length_scaled) {
+                XELOGE(
+                    "Scaled resolve range length is zero for resolve dest at "
+                    "0x{:08X}",
+                    dest_address);
+                scaled_buffer_ready = false;
+              } else {
+                // Get the buffer's base offset to calculate relative offset
+                uint64_t buffer_relative_offset = 0;
+                VkDeviceSize buffer_relative_size = range_length_scaled;
+                size_t buffer_index =
+                    texture_cache.GetScaledResolveCurrentBufferIndex();
+                auto* buffer_info =
+                    texture_cache.GetScaledResolveBufferInfo(buffer_index);
+                if (!buffer_info) {
+                  XELOGE(
+                      "Missing scaled resolve buffer info for resolve dest at "
+                      "0x{:08X}",
+                      dest_address);
+                  scaled_buffer_ready = false;
+                } else {
+                  buffer_relative_offset =
+                      range_start_scaled - buffer_info->range_start_scaled;
+                  if (buffer_relative_offset >= buffer_info->range_length_scaled) {
+                    XELOGE(
+                        "Scaled resolve offset 0x{:X} outside buffer range for "
+                        "resolve dest at 0x{:08X}",
+                        buffer_relative_offset, dest_address);
+                    scaled_buffer_ready = false;
+                  } else {
+                    uint64_t buffer_available =
+                        buffer_info->range_length_scaled -
+                        buffer_relative_offset;
+                    if (buffer_relative_size > buffer_available) {
+                      buffer_relative_size = buffer_available;
+                    }
+                  }
+                }
 
-              // Get the buffer's base offset to calculate relative offset
-              uint64_t buffer_relative_offset = 0;
-              size_t buffer_index =
-                  texture_cache.GetScaledResolveCurrentBufferIndex();
-              auto* buffer_info =
-                  texture_cache.GetScaledResolveBufferInfo(buffer_index);
-              if (buffer_info) {
-                buffer_relative_offset =
-                    scaled_offset - buffer_info->range_start_scaled;
+                if (scaled_buffer_ready) {
+                  write_descriptor_set_dest_buffer_info.buffer = scaled_buffer;
+                  write_descriptor_set_dest_buffer_info.offset =
+                      buffer_relative_offset;
+                  write_descriptor_set_dest_buffer_info.range =
+                      buffer_relative_size;
+                  if (!write_descriptor_set_dest_buffer_info.range) {
+                    XELOGE(
+                        "Scaled resolve buffer size is zero for resolve dest at "
+                        "0x{:08X}",
+                        dest_address);
+                    scaled_buffer_ready = false;
+                  }
+                }
               }
-
-              write_descriptor_set_dest_buffer_info.buffer = scaled_buffer;
-              write_descriptor_set_dest_buffer_info.offset =
-                  buffer_relative_offset;
-              write_descriptor_set_dest_buffer_info.range =
-                  dest_length * draw_resolution_scale_area;
             }
           }
 
@@ -1222,6 +1262,10 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             VkBuffer scaled_buffer =
                 texture_cache.GetCurrentScaledResolveBuffer();
             if (scaled_buffer != VK_NULL_HANDLE) {
+              VkDeviceSize buffer_offset =
+                  write_descriptor_set_dest_buffer_info.offset;
+              VkDeviceSize buffer_size =
+                  write_descriptor_set_dest_buffer_info.range;
               VkBufferMemoryBarrier buffer_barrier = {};
               buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
               // More specific: previous compute shader reads to compute shader
@@ -1231,8 +1275,8 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
               buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
               buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
               buffer_barrier.buffer = scaled_buffer;
-              buffer_barrier.offset = 0;
-              buffer_barrier.size = VK_WHOLE_SIZE;
+              buffer_barrier.offset = buffer_offset;
+              buffer_barrier.size = buffer_size;
 
               command_buffer.CmdVkPipelineBarrier(
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  // From compute shader
@@ -1275,6 +1319,10 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             VkBuffer scaled_buffer =
                 texture_cache.GetCurrentScaledResolveBuffer();
             if (scaled_buffer != VK_NULL_HANDLE) {
+              VkDeviceSize buffer_offset =
+                  write_descriptor_set_dest_buffer_info.offset;
+              VkDeviceSize buffer_size =
+                  write_descriptor_set_dest_buffer_info.range;
               VkBufferMemoryBarrier buffer_barrier = {};
               buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
               buffer_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1282,8 +1330,8 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
               buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
               buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
               buffer_barrier.buffer = scaled_buffer;
-              buffer_barrier.offset = 0;
-              buffer_barrier.size = VK_WHOLE_SIZE;
+              buffer_barrier.offset = buffer_offset;
+              buffer_barrier.size = buffer_size;
 
               command_buffer.CmdVkPipelineBarrier(
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

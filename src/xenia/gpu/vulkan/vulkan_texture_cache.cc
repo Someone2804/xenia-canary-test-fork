@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -1309,25 +1311,44 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           if (scaled_buffer != VK_NULL_HANDLE) {
             // Calculate offset within the scaled buffer
             uint64_t scaled_offset =
-                uint64_t(guest_address) * texture_resolution_scale_area;
+                scaled_resolve_current_range_start_scaled_;
+            uint64_t guest_size_scaled = xe::align<uint64_t>(
+                uint64_t(guest_size) * texture_resolution_scale_area,
+                uint64_t(source_length_alignment));
 
             uint64_t buffer_relative_offset = 0;
+            VkDeviceSize buffer_relative_size = guest_size_scaled;
             if (scaled_resolve_current_buffer_index_ <
                 scaled_resolve_buffers_.size()) {
               const ScaledResolveBuffer& current_buffer =
                   scaled_resolve_buffers_[scaled_resolve_current_buffer_index_];
               buffer_relative_offset =
                   scaled_offset - current_buffer.range_start_scaled;
+              uint64_t buffer_available =
+                  current_buffer.range_length_scaled - buffer_relative_offset;
+              buffer_relative_size =
+                  std::min<uint64_t>(buffer_relative_size,
+                                     std::min<uint64_t>(
+                                         scaled_resolve_current_range_length_scaled_,
+                                         buffer_available));
             }
 
             write_descriptor_set_source_base_buffer_info.buffer = scaled_buffer;
             write_descriptor_set_source_base_buffer_info.offset =
                 buffer_relative_offset;
-            uint64_t guest_size_scaled =
-                uint64_t(guest_size) * texture_resolution_scale_area;
             write_descriptor_set_source_base_buffer_info.range =
-                xe::align<uint64_t>(guest_size_scaled,
-                                    uint64_t(source_length_alignment));
+                buffer_relative_size;
+
+            if (buffer_relative_size) {
+              command_processor_.PushBufferMemoryBarrier(
+                  scaled_buffer, buffer_relative_offset, buffer_relative_size,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_ACCESS_SHADER_READ_BIT);
+            }
 
           } else {
             XELOGE(
@@ -1394,26 +1415,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VkBuffer scaled_buffer = GetCurrentScaledResolveBuffer();
           if (scaled_buffer != VK_NULL_HANDLE) {
             uint64_t scaled_offset =
-                uint64_t(guest_address) * texture_resolution_scale_area;
+                scaled_resolve_current_range_start_scaled_;
+            uint64_t guest_mips_size_scaled = xe::align<uint64_t>(
+                uint64_t(guest_size) * texture_resolution_scale_area,
+                uint64_t(source_length_alignment));
 
             uint64_t buffer_relative_offset = 0;
+            VkDeviceSize buffer_relative_size = guest_mips_size_scaled;
             if (scaled_resolve_current_buffer_index_ <
                 scaled_resolve_buffers_.size()) {
               const ScaledResolveBuffer& current_buffer =
                   scaled_resolve_buffers_[scaled_resolve_current_buffer_index_];
               buffer_relative_offset =
                   scaled_offset - current_buffer.range_start_scaled;
+              uint64_t buffer_available =
+                  current_buffer.range_length_scaled - buffer_relative_offset;
+              buffer_relative_size =
+                  std::min<uint64_t>(buffer_relative_size,
+                                     std::min<uint64_t>(
+                                         scaled_resolve_current_range_length_scaled_,
+                                         buffer_available));
             }
 
             write_descriptor_set_source_mips_buffer_info.buffer =
                 scaled_buffer;
             write_descriptor_set_source_mips_buffer_info.offset =
                 buffer_relative_offset;
-            uint64_t guest_mips_size_scaled =
-                uint64_t(guest_size) * texture_resolution_scale_area;
             write_descriptor_set_source_mips_buffer_info.range =
-                xe::align<uint64_t>(guest_mips_size_scaled,
-                                    uint64_t(source_length_alignment));
+                buffer_relative_size;
+
+            if (buffer_relative_size) {
+              command_processor_.PushBufferMemoryBarrier(
+                  scaled_buffer, buffer_relative_offset, buffer_relative_size,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_ACCESS_SHADER_READ_BIT);
+            }
           } else {
             XELOGE(
                 "Scaled resolve texture load: Failed to get current scaled "
@@ -2905,6 +2945,10 @@ bool VulkanTextureCache::MakeScaledResolveRangeCurrent(
     return false;
   }
 
+  if (!length_unscaled) {
+    return false;
+  }
+
   // First ensure the memory is committed (creates buffers if needed)
   if (!EnsureScaledResolveMemoryCommitted(start_unscaled, length_unscaled,
                                           length_scaled_alignment_log2)) {
@@ -2914,14 +2958,29 @@ bool VulkanTextureCache::MakeScaledResolveRangeCurrent(
   uint32_t draw_resolution_scale_area =
       draw_resolution_scale_x() * draw_resolution_scale_y();
   uint64_t start_scaled = uint64_t(start_unscaled) * draw_resolution_scale_area;
+  uint64_t length_scaled_alignment_bits =
+      (UINT64_C(1) << length_scaled_alignment_log2) - 1;
+  uint64_t length_scaled =
+      (uint64_t(length_unscaled) * draw_resolution_scale_area +
+       length_scaled_alignment_bits) &
+      ~length_scaled_alignment_bits;
+  if (!length_scaled) {
+    return false;
+  }
+
+  scaled_resolve_current_buffer_index_ = SIZE_MAX;
+  scaled_resolve_current_range_start_scaled_ = 0;
+  scaled_resolve_current_range_length_scaled_ = 0;
 
   // Find which buffer contains this range
   for (size_t i = 0; i < scaled_resolve_buffers_.size(); ++i) {
     const ScaledResolveBuffer& buffer = scaled_resolve_buffers_[i];
     if (start_scaled >= buffer.range_start_scaled &&
-        start_scaled <
+        (start_scaled + length_scaled) <=
             (buffer.range_start_scaled + buffer.range_length_scaled)) {
       scaled_resolve_current_buffer_index_ = i;
+      scaled_resolve_current_range_start_scaled_ = start_scaled;
+      scaled_resolve_current_range_length_scaled_ = length_scaled;
       return true;
     }
   }
