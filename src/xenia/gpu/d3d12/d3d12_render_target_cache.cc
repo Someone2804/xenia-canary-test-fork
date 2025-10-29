@@ -36,6 +36,10 @@
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
+namespace {
+constexpr bool kDogAlphaUseHighByte = true;
+}
+
 DEFINE_bool(
     native_stencil_value_output_d3d12_intel, false,
     "Allow stencil reference output usage on Direct3D 12 on Intel GPUs - not "
@@ -75,8 +79,6 @@ namespace gpu {
 namespace d3d12 {
 
 namespace {
-constexpr bool kDogAlphaUseHighByte = true;
-
 static xenos::ColorRenderTargetFormat GetMorphRenderTargetFormatForTexture(
     xenos::TextureFormat format) {
   switch (format) {
@@ -178,13 +180,6 @@ constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
          shaders::resolve_full_128bpp_scaled_cs,
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
 };
-
-RenderTargetCache::RenderTargetKey
-D3D12RenderTargetCache::CanonicalizeHostSurfaceRenderTargetKey(
-    RenderTargetCache::RenderTargetKey key) {
-  key.host_repacked = 0;
-  return key;
-}
 
 bool D3D12RenderTargetCache::IsMorphResolveFormat(xenos::ColorFormat format) {
   switch (format) {
@@ -1366,12 +1361,11 @@ void D3D12RenderTargetCache::RemoveHostSurface(HostSurface* surface) {
 
 D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
     RenderTargetKey key, uint32_t width_pixels, uint32_t height_pixels) {
-  RenderTargetKey canonical_key = CanonicalizeHostSurfaceRenderTargetKey(key);
-  auto it = host_surfaces_by_render_target_.find(canonical_key);
+  auto it = host_surfaces_by_render_target_.find(key);
   if (it != host_surfaces_by_render_target_.end()) {
     HostSurface* existing = it->second.get();
     if (existing && existing->render_target) {
-      SetRenderTargetForKey(canonical_key, existing->render_target);
+      SetRenderTargetForKey(key, existing->render_target);
       existing->rtv_format = existing->render_target->rtv_format();
       return existing;
     }
@@ -1511,7 +1505,7 @@ D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
   surface->texture_key.width = width;
   surface->texture_key.height = height;
   surface->texture_key.signed_mask = 0;
-  surface->render_target_key = canonical_key;
+  surface->render_target_key = key;
   surface->resource = resource;
   surface->resource_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
   surface->shared_state = &surface->resource_state;
@@ -1530,8 +1524,8 @@ D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
       surface->resource_state, surface->shared_state);
 
   HostSurface* surface_ptr = surface.get();
-  host_surfaces_by_render_target_.emplace(canonical_key, std::move(surface));
-  SetRenderTargetForKey(canonical_key, surface_ptr->render_target);
+  host_surfaces_by_render_target_.emplace(key, std::move(surface));
+  SetRenderTargetForKey(key, surface_ptr->render_target);
   return surface_ptr;
 }
 
@@ -1544,43 +1538,6 @@ void D3D12RenderTargetCache::TransitionRenderTargetToState(
   }
   command_processor_.PushTransitionBarrier(render_target.resource(), old_state,
                                            new_state);
-
-  auto host_surface_it = host_surfaces_by_render_target_.find(
-      CanonicalizeHostSurfaceRenderTargetKey(render_target.key()));
-  if (host_surface_it != host_surfaces_by_render_target_.end()) {
-    HostSurface* host_surface = host_surface_it->second.get();
-    if (host_surface) {
-      if ((new_state &
-           (D3D12_RESOURCE_STATE_RENDER_TARGET |
-            D3D12_RESOURCE_STATE_COPY_DEST)) != 0) {
-        if (host_surface->texture_registered && host_surface->seeded) {
-          command_processor_.texture_cache().InvalidateHostSurfaceBindings(
-              host_surface->texture_key.base_page,
-              host_surface->texture_key.texture_format,
-              host_surface->texture_key.width,
-              host_surface->texture_key.height,
-              host_surface->texture_key.signed_mask);
-        }
-      }
-      if (host_surface->shared_state) {
-        *host_surface->shared_state = new_state;
-      }
-      host_surface->resource_state = new_state;
-      if (host_surface->texture_registered && host_surface->seeded) {
-        static uint32_t morph_transition_log_count = 0;
-        if (morph_transition_log_count < 64) {
-          ++morph_transition_log_count;
-          XELOGGPU(
-              "Morph host surface transition base_page=0x{:05X} format={} "
-              "{:08X}->{:08X}",
-              host_surface->texture_key.base_page,
-              uint32_t(host_surface->texture_key.texture_format),
-              static_cast<uint32_t>(old_state),
-              static_cast<uint32_t>(new_state));
-        }
-      }
-    }
-  }
 }
 
 bool D3D12RenderTargetCache::CreateAndSeedHostSurfaceFromResolve(
@@ -1650,8 +1607,7 @@ bool D3D12RenderTargetCache::CreateAndSeedHostSurfaceFromResolve(
     return false;
   }
 
-  TransitionRenderTargetToState(
-      d3d12_rt, D3D12_RESOURCE_STATE_COPY_DEST);
+  TransitionRenderTargetToState(d3d12_rt, D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
 
   D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
@@ -1940,9 +1896,8 @@ bool D3D12RenderTargetCache::CreateAndSeedHostSurfaceFromResolve(
   }
 
   TransitionRenderTargetToState(
-      d3d12_rt,
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      d3d12_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   command_processor_.SubmitBarriers();
 
   surface->resource_state =
@@ -2057,14 +2012,6 @@ bool D3D12RenderTargetCache::AcquireHostSurface(
   }
   HostSurface* surface = surface_it->second;
   if (!surface->seeded) {
-    static uint32_t morph_host_surface_unseeded_logs = 0;
-    if (morph_host_surface_unseeded_logs < 16) {
-      ++morph_host_surface_unseeded_logs;
-      XELOGGPU(
-          "Morph host surface base_page=0x{:05X} format={} requested before "
-          "seeding",
-          surface_key.base_page, uint32_t(surface_key.texture_format));
-    }
     return false;
   }
   if (!surface->render_target || !surface->resource.Get()) {
@@ -2077,7 +2024,7 @@ bool D3D12RenderTargetCache::AcquireHostSurface(
     D3D12_RESOURCE_STATES required_state =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (surface->resource_state != required_state) {
+    if (surface->render_target->resource_state() != required_state) {
       TransitionRenderTargetToState(*surface->render_target, required_state);
       command_processor_.SubmitBarriers();
     }
@@ -2112,16 +2059,6 @@ bool D3D12RenderTargetCache::EnsureHostSurfaceForTexture(
                                             surface_key.width,
                                             surface_key.height);
   if (!surface || !surface->render_target) {
-    static uint32_t morph_host_surface_ensure_failures = 0;
-    if (morph_host_surface_ensure_failures < 16) {
-      ++morph_host_surface_ensure_failures;
-      XELOGGPU(
-          "Failed to ensure morph host surface for base_page=0x{:05X} "
-          "format={} w={} h={} (surface {} render_target {})",
-          surface_key.base_page, uint32_t(surface_key.texture_format),
-          surface_key.width, surface_key.height, surface != nullptr,
-          surface && surface->render_target != nullptr);
-    }
     return false;
   }
 
@@ -2144,9 +2081,7 @@ bool D3D12RenderTargetCache::EnsureHostSurfaceForTexture(
   if (surface_key.base_page) {
     host_surfaces_by_base_page_[surface_key.base_page] = surface;
   }
-  surface->render_target_key =
-      CanonicalizeHostSurfaceRenderTargetKey(
-          metadata_it->second.render_target_key);
+  surface->render_target_key = metadata_it->second.render_target_key;
   surface->number_format = metadata_it->second.number_format;
   surface->signed_mask = surface_key.signed_mask;
   if (surface->render_target) {
@@ -2164,7 +2099,7 @@ bool D3D12RenderTargetCache::EnsureHostSurfaceForTexture(
     D3D12_RESOURCE_STATES required_state =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (surface->resource_state != required_state) {
+    if (surface->render_target->resource_state() != required_state) {
       TransitionRenderTargetToState(*surface->render_target, required_state);
       command_processor_.SubmitBarriers();
     }
@@ -5647,7 +5582,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         TransitionRenderTargetToState(
             dest_d3d12_rt,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         // Pipeline.
         command_processor_.SetExternalPipeline(
             host_depth_store_pipelines_[size_t(dest_rt_key.msaa_samples)]);
@@ -5880,12 +5816,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                                            ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                            : D3D12_RESOURCE_STATE_RENDER_TARGET;
     TransitionRenderTargetToState(dest_d3d12_rt, dest_state);
-    command_processor_.SubmitBarriers();
 
     if (!current_transfers.empty()) {
       are_current_command_list_render_targets_valid_ = false;
       if (dest_rt_key.is_depth) {
         auto handle = dest_d3d12_rt.descriptor_draw().GetHandle();
+        command_processor_.SubmitBarriers();
         command_list.D3DOMSetRenderTargets(0, nullptr, false, &handle);
         if (!use_stencil_reference_output_) {
           command_processor_.SetStencilReference(UINT8_MAX);
@@ -5898,6 +5834,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.resource()->GetDesc();
         assert_true((render_target_desc.Flags &
                      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
+        command_processor_.SubmitBarriers();
         command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
       }
 
@@ -6127,8 +6064,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
           }
         }
-
-        command_processor_.SubmitBarriers();
 
         uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
         D3D12_VERTEX_BUFFER_VIEW transfer_rectangle_buffer_view;
@@ -6513,12 +6448,14 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               (dest_d3d12_rt.descriptor_load_separate().IsValid()
                    ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
                    : dest_d3d12_rt.descriptor_draw().GetHandle());
+
           D3D12_RESOURCE_DESC render_target_desc =
               dest_d3d12_rt.resource()->GetDesc();
           assert_true((render_target_desc.Flags &
                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
 
           command_processor_.SubmitBarriers();
+
           command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
           are_current_command_list_render_targets_valid_ = true;
           D3D12_VIEWPORT clear_viewport;
@@ -7517,7 +7454,9 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
     TransitionRenderTargetToState(
-        d3d12_rt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        d3d12_rt,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (d3d12_rt.temporary_sort_index() == UINT32_MAX) {
       d3d12_rt.SetTemporarySortIndex(rt_sort_index++);
     }
