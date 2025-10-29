@@ -270,6 +270,18 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // For host render targets.
 
   class D3D12RenderTarget final : public RenderTarget {
+
+    private:
+      D3D12_RESOURCE_STATES* morph_shared_state_ = nullptr;
+
+    public:
+      // mark this RT uses a shared HostSurface resource state
+      void AttachMorphHostSurface(D3D12_RESOURCE_STATES* shared_state) {
+        morph_shared_state_ = shared_state;
+      }
+      void DetachMorphHostSurface() { morph_shared_state_ = nullptr; }
+      bool is_morph_host_surface() const { return morph_shared_state_ != nullptr; }
+      D3D12_RESOURCE_STATES* morph_shared_state() const { return morph_shared_state_; }
    public:
     // descriptor_draw_srgb is only used for k_8_8_8_8 render targets when host
     // sRGB (gamma_render_target_as_srgb) is used. descriptor_load is present

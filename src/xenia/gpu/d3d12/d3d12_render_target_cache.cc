@@ -1532,6 +1532,20 @@ D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
 void D3D12RenderTargetCache::TransitionRenderTargetToState(
     D3D12RenderTarget& render_target,
     D3D12_RESOURCE_STATES new_state) {
+
+    if (rt.is_morph_host_surface()) {
+        D3D12_RESOURCE_STATES* shared = rt.morph_shared_state();
+        D3D12_RESOURCE_STATES old_state =
+            shared ? *shared : D3D12_RESOURCE_STATE_COMMON;
+        if (old_state != new_state) {
+          command_processor_.PushTransitionBarrier(res, old_state, new_state);
+          // Здесь НЕ откладываем на потом: этот helper традиционно сразу пушит,
+          // а call site позже делает SubmitBarriers().
+          if (shared) *shared = new_state;
+        }
+        return;
+      }
+
   D3D12_RESOURCE_STATES old_state = render_target.SetResourceState(new_state);
   if (old_state == new_state) {
     return;

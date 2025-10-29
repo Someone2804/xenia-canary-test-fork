@@ -1356,13 +1356,22 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     ID3D12Resource* host_resource = nullptr;
     D3D12_RESOURCE_STATES* shared_state = nullptr;
     bool surface_seeded = false;
-    if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
-            surface_key, host_resource, shared_state, surface_seeded)) {
-      if (host_resource != nullptr && shared_state != nullptr) {
-        return std::unique_ptr<Texture>(new D3D12Texture(
-            *this, key, host_resource, *shared_state, shared_state));
-      }
-    }
+     if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+                surface_key, host_resource, shared_state, surface_seeded)) {
+          if (host_resource && shared_state) {
+            auto tex = std::unique_ptr<Texture>(new D3D12Texture(
+                *this, key, host_resource, *shared_state, shared_state));
+            if (!surface_seeded) {
+              // первичная инициализация прямо в HostSurface
+              if (FormatInfo::IsK8888A(key.format)) {
+                UploadK8888ATexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
+              } else {
+                UploadPlain16BitTexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
+              }
+            }
+            return tex;
+          }
+        }
   }
   D3D12_RESOURCE_DESC desc;
   desc.Format = GetDXGIResourceFormat(key);
@@ -2205,42 +2214,125 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
       num_rows * footprint.Footprint.RowPitch;
   upload_buffer->Unmap(0, &written_range);
 
-  texture.MarkAsUsed();
+    // ---------- вместо старого блока начиная с texture.MarkAsUsed() ----------
 
-  ID3D12Resource* texture_resource = texture.resource();
-  command_processor_.PushTransitionBarrier(
-      texture_resource,
-      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(
-      upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
+    // 1) Получаем RTV-совместимый общий ресурс для морф-поверхности.
+    const ui::d3d12::D3D12Provider& provider =
+        command_processor_.GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
 
-  D3D12_TEXTURE_COPY_LOCATION source_location;
-  source_location.pResource = upload_buffer.Get();
-  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  source_location.PlacedFootprint = footprint;
+    D3D12RenderTargetCache::HostSurfaceTextureKey hs_key{};
+    hs_key.base_page      = key.base_page;
+    hs_key.texture_format = key.format;
+    hs_key.width          = width;
+    hs_key.height         = height;
+    hs_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
 
-  D3D12_TEXTURE_COPY_LOCATION dest_location;
-  dest_location.pResource = texture_resource;
-  dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dest_location.SubresourceIndex = 0;
+    ID3D12Resource* host_res = nullptr;
+    D3D12_RESOURCE_STATES* shared_state = nullptr;
+    bool seeded = false;
+    DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_UNKNOWN;
 
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-      &dest_location, 0, 0, 0, &source_location, nullptr);
+    if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+            hs_key, host_res, shared_state, seeded, &rtv_fmt_dummy)) {
+      return false;
+    }
 
-  command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+    // 2) Считаем footprint по целевому RTV-совместимому ресурсу.
+    DXGI_FORMAT dxgi_format =
+        key.signed_mask == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM
+                             : DXGI_FORMAT_R8G8B8A8_SNORM;  // SRV формат
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows = 0;
+    UINT64 row_size_bytes = 0, upload_size = 0;
+    {
+      D3D12_RESOURCE_DESC texture_desc = host_res->GetDesc();
+      // Для расчёта копии задаём конкретный пиксельный формат того же размера.
+      texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      device->GetCopyableFootprints(&texture_desc, 0, 1, 0,
+                                    &footprint, &num_rows,
+                                    &row_size_bytes, &upload_size);
+      if (num_rows == 0 || upload_size == 0) return false;
+    }
 
-  command_processor_.PushTransitionBarrier(
-      texture_resource,
-      texture.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  command_processor_.SubmitBarriers();
+    // 3) Готовим upload-буфер и пишем туда RGBA.
+    D3D12_RESOURCE_DESC upload_desc{};
+    ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload,
+            provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&upload_buffer)))) {
+      return false;
+    }
 
-  return true;
+    {
+      uint8_t* upload_mapping = nullptr;
+      D3D12_RANGE read_range{0, 0};
+      if (FAILED(upload_buffer->Map(0, &read_range,
+                                    reinterpret_cast<void**>(&upload_mapping)))) {
+        return false;
+      }
+      uint8_t* upload_data = upload_mapping + footprint.Offset;
+      const size_t src_row_bytes = size_t(width) * 4u;
+      for (UINT row = 0; row < num_rows; ++row) {
+        uint8_t* dst_row = upload_data + row * footprint.Footprint.RowPitch;
+        const uint8_t* src_row = rgba.data() + size_t(row) * src_row_bytes;
+        std::memcpy(dst_row, src_row, src_row_bytes);
+        const size_t pad =
+            footprint.Footprint.RowPitch > src_row_bytes
+                ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                : 0u;
+        if (pad) std::memset(dst_row + src_row_bytes, 0, pad);
+      }
+      D3D12_RANGE written{footprint.Offset,
+                          footprint.Offset + num_rows * footprint.Footprint.RowPitch};
+      upload_buffer->Unmap(0, &written);
+    }
+
+    // 4) Барьеры и копия: upload → HostSurface.resource.
+    const D3D12_RESOURCE_STATES prev =
+        shared_state ? *shared_state : D3D12_RESOURCE_STATE_COMMON;
+
+    command_processor_.PushTransitionBarrier(
+        host_res, prev, D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.PushTransitionBarrier(
+        upload_buffer.Get(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.SubmitBarriers();
+    if (shared_state) *shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = upload_buffer.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = host_res;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    command_processor_.GetDeferredCommandList()
+        .D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+    // 5) Возврат в PSR/NPSR и пометка seeded.
+    const D3D12_RESOURCE_STATES ps_states =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    command_processor_.PushTransitionBarrier(
+        host_res, D3D12_RESOURCE_STATE_COPY_DEST, ps_states);
+    command_processor_.SubmitBarriers();
+    if (shared_state) *shared_state = ps_states;
+
+    command_processor_.render_target_cache().MarkHostSurfaceSeeded(hs_key);
+    texture.MarkAsUsed();
+    return true;
+    // ---------- конец нового блока ----------
 }
 
 bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
@@ -2405,42 +2497,133 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
       num_rows * footprint.Footprint.RowPitch;
   upload_buffer->Unmap(0, &written_range);
 
-  texture.MarkAsUsed();
 
-  ID3D12Resource* texture_resource = texture.resource();
-  command_processor_.PushTransitionBarrier(
-      texture_resource,
-      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(
-      upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
+  const ui::d3d12::D3D12Provider& provider =
+        command_processor_.GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
 
-  D3D12_TEXTURE_COPY_LOCATION source_location;
-  source_location.pResource = upload_buffer.Get();
-  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  source_location.PlacedFootprint = footprint;
+    // 1) RTV-совместимый HostSurface.
+    D3D12RenderTargetCache::HostSurfaceTextureKey hs_key{};
+    hs_key.base_page      = key.base_page;
+    hs_key.texture_format = key.format;
+    hs_key.width          = width;
+    hs_key.height         = height;
+    hs_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
 
-  D3D12_TEXTURE_COPY_LOCATION dest_location;
-  dest_location.pResource = texture_resource;
-  dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dest_location.SubresourceIndex = 0;
+    ID3D12Resource* host_res = nullptr;
+    D3D12_RESOURCE_STATES* shared_state = nullptr;
+    bool seeded = false;
+    DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_UNKNOWN;
 
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-      &dest_location, 0, 0, 0, &source_location, nullptr);
+    if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+            hs_key, host_res, shared_state, seeded, &rtv_fmt_dummy)) {
+      return false;
+    }
 
-  command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+    // 2) DXGI формат FLOAT16 под компонентность.
+    DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
+    switch (component_count) {
+      case 1: dxgi_format = DXGI_FORMAT_R16_FLOAT; break;
+      case 2: dxgi_format = DXGI_FORMAT_R16G16_FLOAT; break;
+      case 4: dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+      default: return false;
+    }
 
-  command_processor_.PushTransitionBarrier(
-      texture_resource,
-      texture.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  command_processor_.SubmitBarriers();
+    // 3) Footprint по host_res.
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows = 0;
+    UINT64 row_size_bytes = 0, upload_size = 0;
+    {
+      D3D12_RESOURCE_DESC texture_desc = host_res->GetDesc();
+      texture_desc.Format = dxgi_format;
+      device->GetCopyableFootprints(&texture_desc, 0, 1, 0,
+                                    &footprint, &num_rows,
+                                    &row_size_bytes, &upload_size);
+      if (num_rows == 0 || upload_size == 0) return false;
+    }
 
-  return true;
+    // 4) Upload-буфер и копирование half-float staging → upload.
+    D3D12_RESOURCE_DESC upload_desc{};
+    ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload,
+            provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&upload_buffer)))) {
+      return false;
+    }
+
+    {
+      uint8_t* upload_mapping = nullptr;
+      D3D12_RANGE read_range{0, 0};
+      if (FAILED(upload_buffer->Map(0, &read_range,
+                                    reinterpret_cast<void**>(&upload_mapping)))) {
+        return false;
+      }
+      uint8_t* upload_data = upload_mapping + footprint.Offset;
+      const size_t src_row_bytes =
+          size_t(width) * component_count * sizeof(uint16_t);
+      for (UINT row = 0; row < num_rows; ++row) {
+        uint8_t* dst_row = upload_data + row * footprint.Footprint.RowPitch;
+        const uint8_t* src_row =
+            reinterpret_cast<const uint8_t*>(staging.data()) +
+            size_t(row) * src_row_bytes;
+        std::memcpy(dst_row, src_row, src_row_bytes);
+        const size_t pad =
+            footprint.Footprint.RowPitch > src_row_bytes
+                ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                : 0u;
+        if (pad) std::memset(dst_row + src_row_bytes, 0, pad);
+      }
+      D3D12_RANGE written{footprint.Offset,
+                          footprint.Offset + num_rows * footprint.Footprint.RowPitch};
+      upload_buffer->Unmap(0, &written);
+    }
+
+    // 5) Барьеры и CopyTextureRegion в HostSurface.resource.
+    const D3D12_RESOURCE_STATES prev =
+        shared_state ? *shared_state : D3D12_RESOURCE_STATE_COMMON;
+
+    command_processor_.PushTransitionBarrier(
+        host_res, prev, D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.PushTransitionBarrier(
+        upload_buffer.Get(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.SubmitBarriers();
+    if (shared_state) *shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = upload_buffer.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = host_res;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    command_processor_.GetDeferredCommandList()
+        .D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+    // 6) Возврат в PSR/NPSR и пометка seeded.
+    const D3D12_RESOURCE_STATES ps_states =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    command_processor_.PushTransitionBarrier(
+        host_res, D3D12_RESOURCE_STATE_COPY_DEST, ps_states);
+    command_processor_.SubmitBarriers();
+    if (shared_state) *shared_state = ps_states;
+
+    command_processor_.render_target_cache().MarkHostSurfaceSeeded(hs_key);
+    texture.MarkAsUsed();
+    return true;
+    // ---------- конец нового блока ----------
+
 }
 
 void D3D12TextureCache::InvalidateHostSurfaceBindings(
