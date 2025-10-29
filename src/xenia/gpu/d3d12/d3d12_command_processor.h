@@ -88,6 +88,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
     return deferred_command_list_;
   }
 
+  D3D12RenderTargetCache& render_target_cache() const {
+    return *render_target_cache_.get();
+  }
+  D3D12TextureCache& texture_cache() const {
+    return *texture_cache_.get();
+  }
+
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
@@ -110,6 +117,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
                            ID3D12Resource* new_resource);
   void PushUAVBarrier(ID3D12Resource* resource);
   void SubmitBarriers();
+
+  void RetainResourceForSubmission(ID3D12Resource* resource);
 
   // Finds or creates root signature for a pipeline.
   ID3D12RootSignature* GetRootSignature(const DxbcShader* vertex_shader,

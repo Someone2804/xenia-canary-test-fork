@@ -663,7 +663,8 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
       if ((texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
            !host_format_pair.format_unsigned.linear_filterable) ||
-          (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
+          (texture_key.signed_mask != 0 &&
+           texture_util::IsAnySignSigned(texture_swizzled_signs) &&
            !host_format_pair.format_signed.linear_filterable)) {
         linear_filterable = false;
       }
@@ -1623,6 +1624,7 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
     if (!binding) {
       continue;
     }
+    bool guest_declares_signed = binding->key.signed_mask != 0;
     if (IsSignedVersionSeparateForFormat(binding->key)) {
       if (binding->texture &&
           texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
@@ -1630,7 +1632,7 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
             static_cast<VulkanTexture*>(binding->texture)
                 ->GetView(false, binding->host_swizzle);
       }
-      if (binding->texture_signed &&
+      if (guest_declares_signed && binding->texture_signed &&
           texture_util::IsAnySignSigned(binding->swizzled_signs)) {
         vulkan_binding.image_view_signed =
             static_cast<VulkanTexture*>(binding->texture_signed)
@@ -1639,16 +1641,17 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
     } else {
       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
       if (texture) {
-        if (texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
-          vulkan_binding.image_view_unsigned =
-              texture->GetView(false, binding->host_swizzle);
-        }
-        if (texture_util::IsAnySignSigned(binding->swizzled_signs)) {
+      if (texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
+        vulkan_binding.image_view_unsigned =
+            texture->GetView(false, binding->host_swizzle);
+      }
+        if (guest_declares_signed &&
+            texture_util::IsAnySignSigned(binding->swizzled_signs)) {
           vulkan_binding.image_view_signed =
               texture->GetView(true, binding->host_swizzle);
         }
-      }
     }
+  }
   }
 }
 

@@ -84,9 +84,55 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
+  struct HostSurfaceTextureKey {
+    uint32_t base_page = 0;
+    xenos::TextureFormat texture_format = xenos::TextureFormat::k_1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint8_t signed_mask = 0;
+    bool operator==(const HostSurfaceTextureKey& other) const {
+      return base_page == other.base_page &&
+             texture_format == other.texture_format &&
+             width == other.width && height == other.height &&
+             signed_mask == other.signed_mask;
+    }
+    struct Hasher {
+      size_t operator()(const HostSurfaceTextureKey& key) const {
+        size_t h = size_t(key.base_page);
+        h ^= size_t(key.texture_format) << 1;
+        h ^= (size_t(key.width) << 17) ^ (size_t(key.height) << 3);
+        h ^= size_t(key.signed_mask) << 11;
+        return h;
+      }
+    };
+  };
+
   bool Resolve(const Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
+
+  void ClearCache() override;
+
+  bool AcquireHostSurface(const HostSurfaceTextureKey& surface_key,
+                          ID3D12Resource*& resource_out,
+                          D3D12_RESOURCE_STATES*& shared_state_out);
+  bool EnsureHostSurfaceForTexture(
+      const HostSurfaceTextureKey& surface_key, ID3D12Resource*& resource_out,
+      D3D12_RESOURCE_STATES*& shared_state_out, bool& seeded_out,
+      DXGI_FORMAT* rtv_format_out = nullptr);
+  bool HasHostSurfaceForGuestBase(
+      uint32_t base_page_or_address) const;
+  void MarkHostSurfaceSeeded(const HostSurfaceTextureKey& surface_key);
+  static bool IsMorphResolveFormat(xenos::ColorFormat format);
+  static bool IsMorphTextureFormat(xenos::TextureFormat format);
+  static uint8_t GetMorphFormatSignedMask(xenos::TextureFormat format,
+                                          xenos::SurfaceNumberFormat number);
+  static bool IsMorphRenderTargetFormat(
+      xenos::ColorRenderTargetFormat format);
+  static xenos::TextureFormat GetMorphTextureFormatFromRenderTarget(
+      xenos::ColorRenderTargetFormat format);
+  static RenderTargetKey CanonicalizeHostSurfaceRenderTargetKey(
+      RenderTargetKey key);
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
@@ -232,24 +278,28 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     // floating-point formats, and to distinguish between two -1 representations
     // in snorm formats).
     D3D12RenderTarget(
-        RenderTargetKey key, ID3D12Resource* resource,
+        RenderTargetKey key, ID3D12Resource* resource, DXGI_FORMAT rtv_format,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_draw,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_draw_srgb,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&&
             descriptor_load_separate,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv_stencil,
-        D3D12_RESOURCE_STATES resource_state)
+        D3D12_RESOURCE_STATES resource_state,
+        D3D12_RESOURCE_STATES* shared_resource_state = nullptr)
         : RenderTarget(key),
+          rtv_format_(rtv_format),
           resource_(resource),
           descriptor_draw_(std::move(descriptor_draw)),
           descriptor_draw_srgb_(std::move(descriptor_draw_srgb)),
           descriptor_load_separate_(std::move(descriptor_load_separate)),
           descriptor_srv_(std::move(descriptor_srv)),
           descriptor_srv_stencil_(std::move(descriptor_srv_stencil)),
-          resource_state_(resource_state) {}
+          resource_state_(resource_state),
+          shared_resource_state_(shared_resource_state) {}
 
     ID3D12Resource* resource() const { return resource_.Get(); }
+    DXGI_FORMAT rtv_format() const { return rtv_format_; }
     const ui::d3d12::D3D12CpuDescriptorPool::Descriptor& descriptor_draw()
         const {
       return descriptor_draw_;
@@ -272,9 +322,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
 
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
-      D3D12_RESOURCE_STATES old_state = resource_state_;
-      resource_state_ = new_state;
+      D3D12_RESOURCE_STATES& state =
+          shared_resource_state_ ? *shared_resource_state_ : resource_state_;
+      D3D12_RESOURCE_STATES old_state = state;
+      state = new_state;
       return old_state;
+    }
+    D3D12_RESOURCE_STATES resource_state() const {
+      return shared_resource_state_ ? *shared_resource_state_
+                                    : resource_state_;
     }
 
     uint32_t temporary_srv_descriptor_index() const {
@@ -295,6 +351,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
 
    private:
+    DXGI_FORMAT rtv_format_;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw_srgb_;
@@ -306,11 +363,76 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv_stencil_;
     D3D12_RESOURCE_STATES resource_state_;
+    D3D12_RESOURCE_STATES* shared_resource_state_ = nullptr;
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
     uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;
     uint32_t temporary_sort_index_ = 0;
   };
+
+
+  struct HostSurface {
+    HostSurfaceTextureKey texture_key;
+    RenderTargetKey render_target_key;
+    D3D12RenderTarget* render_target = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    xenos::SurfaceNumberFormat number_format =
+        xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+    uint8_t signed_mask = 0;
+    D3D12_RESOURCE_STATES resource_state =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    D3D12_RESOURCE_STATES* shared_state = nullptr;
+    bool texture_registered = false;
+    bool seeded = false;
+    DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
+  };
+
+  void TransitionRenderTargetToState(D3D12RenderTarget& render_target,
+                                     D3D12_RESOURCE_STATES new_state);
+
+  struct HostSurfaceMetadataKey {
+    uint32_t base_page = 0;
+    xenos::TextureFormat texture_format = xenos::TextureFormat::k_1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool operator==(const HostSurfaceMetadataKey& other) const {
+      return base_page == other.base_page &&
+             texture_format == other.texture_format &&
+             width == other.width && height == other.height;
+    }
+    struct Hasher {
+      size_t operator()(const HostSurfaceMetadataKey& key) const {
+        size_t h = size_t(key.base_page);
+        h ^= size_t(key.texture_format) << 1;
+        h ^= (size_t(key.width) << 17) ^ (size_t(key.height) << 3);
+        return h;
+      }
+    };
+  };
+
+  struct HostSurfaceMetadata {
+    HostSurfaceMetadataKey key;
+    RenderTargetKey render_target_key;
+    xenos::SurfaceNumberFormat number_format =
+        xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+    xenos::CopySampleSelect copy_sample_select = xenos::CopySampleSelect::k0;
+    uint32_t pitch_tiles_at_32bpp = 0;
+    xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X;
+    bool gamma_render_target = false;
+  };
+
+  std::unordered_map<HostSurfaceTextureKey, HostSurface*,
+                     HostSurfaceTextureKey::Hasher>
+      host_surfaces_by_texture_;
+  std::unordered_map<uint32_t, HostSurface*> host_surfaces_by_base_page_;
+  std::unordered_map<HostSurfaceMetadataKey, HostSurfaceMetadata,
+                     HostSurfaceMetadataKey::Hasher>
+      host_surface_metadata_;
+  std::unordered_map<RenderTargetKey, std::unique_ptr<HostSurface>,
+                     RenderTargetKey::Hasher>
+      host_surfaces_by_render_target_;
 
   enum TransferCBVRegister : uint32_t {
     kTransferCBVRegisterStencilMask,
@@ -715,6 +837,21 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                          uint32_t dump_rows, uint32_t dump_pitch);
+
+  void ClearHostSurfaces();
+  void RemoveHostSurface(HostSurface* surface);
+  void EnsureHostSurfaceMetadataForTexture(
+      const HostSurfaceTextureKey& surface_key);
+  HostSurface* EnsureHostSurface(RenderTargetKey key, uint32_t width_pixels,
+                                 uint32_t height_pixels);
+  bool CreateAndSeedHostSurfaceFromResolve(
+      const HostSurfaceTextureKey& surface_key,
+      const HostSurfaceMetadata& metadata,
+      const draw_util::ResolveInfo& resolve_info,
+      D3D12SharedMemory& shared_memory);
+  void RegisterHostSurfaceFromResolve(
+      const draw_util::ResolveInfo& resolve_info,
+      D3D12SharedMemory& shared_memory);
 
   bool use_stencil_reference_output_ = false;
 

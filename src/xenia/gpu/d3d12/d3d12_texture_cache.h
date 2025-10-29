@@ -32,6 +32,7 @@ namespace gpu {
 namespace d3d12 {
 
 class D3D12CommandProcessor;
+class D3D12RenderTargetCache;
 
 class D3D12TextureCache final : public TextureCache {
  public:
@@ -161,6 +162,17 @@ class D3D12TextureCache final : public TextureCache {
   ID3D12Resource* RequestSwapTexture(
       D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
       xenos::TextureFormat& format_out);
+
+  // Clears cached bindings referencing a morph host surface so the render-
+  // target cache can safely transition the shared resource back to render-
+  // target usage.
+  void InvalidateHostSurfaceBindings(uint32_t base_page,
+                                     xenos::TextureFormat format,
+                                     uint32_t width, uint32_t height,
+                                     uint8_t signed_mask);
+
+  void WriteNullSRVDescriptor(uint32_t descriptor_index,
+                              xenos::DataDimension dimension);
   struct HostFormat {
     // Format info for the regular case.
     // DXGI format (typeless when different signedness or number representation
@@ -287,8 +299,9 @@ class D3D12TextureCache final : public TextureCache {
        DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
        kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
       // k_8_8_8_8_A
-      {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
-       DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
+      {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+       kLoadShaderIndexUnknown, DXGI_FORMAT_R8G8B8A8_SNORM,
+       kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
        kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
       // k_4_4_4_4
       // Red and blue swapped in the load shader for simplicity.
@@ -340,18 +353,18 @@ class D3D12TextureCache final : public TextureCache {
        DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
        xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
       // k_16
-      {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, kLoadShaderIndex16bpb,
-       DXGI_FORMAT_R16_SNORM, kLoadShaderIndexUnknown, false,
+      {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, kLoadShaderIndexUnknown,
+       DXGI_FORMAT_R16_FLOAT, kLoadShaderIndexUnknown, false,
        DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
        xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
       // k_16_16
-      {DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UNORM,
-       kLoadShaderIndex32bpb, DXGI_FORMAT_R16G16_SNORM, kLoadShaderIndexUnknown,
-       false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
-       xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
+      {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT,
+       kLoadShaderIndexUnknown, DXGI_FORMAT_R16G16_FLOAT,
+       kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
+       kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
       // k_16_16_16_16
-      {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM,
-       kLoadShaderIndex64bpb, DXGI_FORMAT_R16G16B16A16_SNORM,
+      {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+       kLoadShaderIndexUnknown, DXGI_FORMAT_R16G16B16A16_FLOAT,
        kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
        kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
       // k_16_EXPAND
@@ -543,6 +556,7 @@ class D3D12TextureCache final : public TextureCache {
                                              bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
+  void AdjustHostRepackForKey(TextureKey& key) override;
 
  private:
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
@@ -574,14 +588,26 @@ class D3D12TextureCache final : public TextureCache {
 
     explicit D3D12Texture(D3D12TextureCache& texture_cache,
                           const TextureKey& key, ID3D12Resource* resource,
-                          D3D12_RESOURCE_STATES resource_state);
+                          D3D12_RESOURCE_STATES resource_state,
+                          D3D12_RESOURCE_STATES* shared_resource_state =
+                              nullptr);
     ~D3D12Texture();
 
     ID3D12Resource* resource() const { return resource_.Get(); }
+    bool IsSharedResource() const { return shared_resource_state_ != nullptr; }
+    D3D12_RESOURCE_STATES resource_state() const {
+      return shared_resource_state_ ? *shared_resource_state_
+                                    : resource_state_;
+    }
+    D3D12_RESOURCE_STATES* shared_resource_state_ptr() const {
+      return shared_resource_state_;
+    }
 
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
-      D3D12_RESOURCE_STATES old_state = resource_state_;
-      resource_state_ = new_state;
+      D3D12_RESOURCE_STATES& state =
+          shared_resource_state_ ? *shared_resource_state_ : resource_state_;
+      D3D12_RESOURCE_STATES old_state = state;
+      state = new_state;
       return old_state;
     }
 
@@ -598,6 +624,7 @@ class D3D12TextureCache final : public TextureCache {
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    D3D12_RESOURCE_STATES* shared_resource_state_ = nullptr;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
     // copying to the shader-visible heap (much faster than recreating, which,
@@ -711,6 +738,11 @@ class D3D12TextureCache final : public TextureCache {
   DXGI_FORMAT GetDXGIUnormFormat(TextureKey key) const {
     return GetDXGIUnormFormat(key.format, key.GetWidth(), key.GetHeight());
   }
+
+  bool UploadK8888ATexture(D3D12Texture& texture, bool load_base,
+                           bool load_mips);
+  bool UploadPlain16BitTexture(D3D12Texture& texture, bool load_base,
+                               bool load_mips);
 
   LoadShaderIndex GetLoadShaderIndex(TextureKey key) const;
   // chrispy: todo, can use simple branchless tests here

@@ -618,10 +618,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           "Surface pitch aligned to EDRAM tiles and resolution-scaled {} "
           "larger than the maximum host render target width {}",
           pitch_pixels_tile_aligned_scaled, max_render_target_width);
-      return false;
     }
   }
-
   // Get used render targets.
   // [0] is depth / stencil where relevant, [1...4] is color.
   // Depth / stencil testing / writing is before color in the pipeline.
@@ -629,9 +627,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // depth_and_color_rts_used_bits -> EDRAM base.
   uint32_t edram_bases[1 + xenos::kMaxColorRenderTargets];
   uint32_t resource_formats[1 + xenos::kMaxColorRenderTargets];
+  bool resource_formats_host_repacked[1 + xenos::kMaxColorRenderTargets] = {};
   uint32_t rts_are_64bpp = 0;
   uint32_t color_rts_are_gamma = 0;
-  if (is_rasterization_done) {
     if (normalized_depth_control.z_enable ||
         normalized_depth_control.stencil_enable) {
       depth_and_color_rts_used_bits |= 1;
@@ -641,6 +639,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       // the format.
       resource_formats[0] =
           interlock_barrier_only ? 0 : uint32_t(rb_depth_info.depth_format);
+      resource_formats_host_repacked[0] = false;
     }
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
@@ -675,9 +674,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
             GetColorResourceFormat(xenos::GetStorageColorFormat(color_format));
       }
       resource_formats[rt_bit_index] = uint32_t(color_resource_format);
+      resource_formats_host_repacked[rt_bit_index] =
+          !interlock_barrier_only &&
+          IsHostRepackedColorFormat(color_resource_format);
     }
-  }
-
   uint32_t rts_remaining;
   uint32_t rt_index;
 
@@ -831,6 +831,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
+    rt_key.host_repacked =
+        resource_formats_host_repacked[rt_bit_index] ? 1 : 0;
     if (!interlock_barrier_only) {
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
       if (!render_target) {
@@ -1335,8 +1337,13 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
     color_render_target_key.msaa_samples = msaa_samples;
     color_render_target_key.is_depth = 0;
-    color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
-        xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
+    xenos::ColorRenderTargetFormat storage_color_format =
+        GetColorResourceFormat(
+            xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format));
+    color_render_target_key.resource_format =
+        uint32_t(storage_color_format);
+    color_render_target_key.host_repacked =
+        IsHostRepackedColorFormat(storage_color_format);
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
     if (!color_render_target) {
       // Failed to create the color render target, don't clear it.
@@ -1395,8 +1402,11 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
   }
   RenderTargetKey render_target_key;
   render_target_key.pitch_tiles_at_32bpp = kPitchTilesAt32bpp;
-  render_target_key.resource_format =
-      uint32_t(GetColorResourceFormat(color_format));
+  xenos::ColorRenderTargetFormat storage_color_format =
+      GetColorResourceFormat(color_format);
+  render_target_key.resource_format = uint32_t(storage_color_format);
+  render_target_key.host_repacked =
+      IsHostRepackedColorFormat(storage_color_format);
   RenderTarget* render_target = GetOrCreateRenderTarget(render_target_key);
   if (!render_target) {
     return nullptr;
@@ -1462,6 +1472,23 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     render_targets_.emplace(key, render_target);
   }
   return render_target;
+}
+
+void RenderTargetCache::SetRenderTargetForKey(RenderTargetKey key,
+                                              RenderTarget* render_target) {
+  auto it = render_targets_.find(key);
+  if (it != render_targets_.end()) {
+    if (it->second && it->second != render_target) {
+      delete it->second;
+    }
+    if (render_target) {
+      it->second = render_target;
+    } else {
+      render_targets_.erase(it);
+    }
+  } else if (render_target) {
+    render_targets_.emplace(key, render_target);
+  }
 }
 
 bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(

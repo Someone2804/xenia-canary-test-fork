@@ -83,6 +83,11 @@ class D3D12SharedMemory : public SharedMemory {
   void WriteUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                   uint32_t element_size_bytes_pow2);
 
+  template <typename T = uint8_t>
+  const T* TranslatePhysical(uint32_t address) const {
+    return memory().TranslatePhysical<const T*>(address);
+  }
+
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();

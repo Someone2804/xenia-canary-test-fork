@@ -9,15 +9,22 @@
 
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
 
+#include <algorithm>
 #include <array>
 #include <cfloat>
+#include <cstdint>
 #include <cstring>
+#include <vector>
+
+#include <DirectXPackedVector.h>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/texture_info.h"
@@ -29,6 +36,34 @@
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+namespace {
+constexpr bool kDogAlphaUseHighByte = true;
+bool IsPlain16BitFormat(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_16_16:
+      return true;
+    default:
+      return false;
+  }
+}
+
+uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_16:
+      return 1;
+    case xenos::TextureFormat::k_16_16:
+      return 2;
+    case xenos::TextureFormat::k_16_16_16_16:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1193,15 +1228,21 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(
 
 D3D12TextureCache::D3D12Texture::D3D12Texture(
     D3D12TextureCache& texture_cache, const TextureKey& key,
-    ID3D12Resource* resource, D3D12_RESOURCE_STATES resource_state)
+    ID3D12Resource* resource, D3D12_RESOURCE_STATES resource_state,
+    D3D12_RESOURCE_STATES* shared_resource_state)
     : Texture(texture_cache, key),
       resource_(resource),
-      resource_state_(resource_state) {
+      resource_state_(resource_state),
+      shared_resource_state_(shared_resource_state) {
   ID3D12Device* device =
       texture_cache.command_processor_.GetD3D12Provider().GetDevice();
   D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
-  SetHostMemoryUsage(
-      device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+  if (shared_resource_state_) {
+    SetHostMemoryUsage(0);
+  } else {
+    SetHostMemoryUsage(
+        device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+  }
 }
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
@@ -1298,8 +1339,31 @@ uint32_t D3D12TextureCache::GetMaxHostTextureDepthOrArraySize(
   }
 }
 
+void D3D12TextureCache::AdjustHostRepackForKey(TextureKey& key) {
+  TextureCache::AdjustHostRepackForKey(key);
+}
+
 std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     TextureKey key) {
+  if (D3D12RenderTargetCache::IsMorphTextureFormat(key.format) &&
+      key.host_repacked) {
+    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+    surface_key.base_page = key.base_page;
+    surface_key.texture_format = key.format;
+    surface_key.width = key.GetWidth();
+    surface_key.height = key.GetHeight();
+    surface_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
+    ID3D12Resource* host_resource = nullptr;
+    D3D12_RESOURCE_STATES* shared_state = nullptr;
+    bool surface_seeded = false;
+    if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+            surface_key, host_resource, shared_state, surface_seeded)) {
+      if (host_resource != nullptr && shared_state != nullptr) {
+        return std::unique_ptr<Texture>(new D3D12Texture(
+            *this, key, host_resource, *shared_state, shared_state));
+      }
+    }
+  }
   D3D12_RESOURCE_DESC desc;
   desc.Format = GetDXGIResourceFormat(key);
   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
@@ -1349,6 +1413,45 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  bool adopt_host_surface =
+      D3D12RenderTargetCache::IsMorphTextureFormat(texture_key.format) &&
+      texture_key.host_repacked;
+  D3D12RenderTargetCache::HostSurfaceTextureKey host_surface_key;
+  if (adopt_host_surface) {
+    host_surface_key.base_page = texture_key.base_page;
+    host_surface_key.texture_format = texture_key.format;
+    host_surface_key.width = texture_key.GetWidth();
+    host_surface_key.height = texture_key.GetHeight();
+    host_surface_key.signed_mask = static_cast<uint8_t>(texture_key.signed_mask);
+  }
+
+  if (adopt_host_surface) {
+    ID3D12Resource* host_surface_resource_unused = nullptr;
+    D3D12_RESOURCE_STATES* host_surface_state_unused = nullptr;
+    bool host_surface_seeded_unused = false;
+    command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+        host_surface_key, host_surface_resource_unused,
+        host_surface_state_unused, host_surface_seeded_unused);
+  }
+
+  if (texture_key.format == xenos::TextureFormat::k_8_8_8_8_A) {
+    bool success =
+        UploadK8888ATexture(d3d12_texture, load_base, load_mips);
+    if (success && adopt_host_surface) {
+      command_processor_.render_target_cache().MarkHostSurfaceSeeded(
+          host_surface_key);
+    }
+    return success;
+  }
+  if (IsPlain16BitFormat(texture_key.format)) {
+    bool success =
+        UploadPlain16BitTexture(d3d12_texture, load_base, load_mips);
+    if (success && adopt_host_surface) {
+      command_processor_.render_target_cache().MarkHostSurfaceSeeded(
+          host_surface_key);
+    }
+    return success;
+  }
 
   DeferredCommandList& command_list =
       command_processor_.GetDeferredCommandList();
@@ -1758,6 +1861,11 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  if (adopt_host_surface) {
+    command_processor_.render_target_cache().MarkHostSurfaceSeeded(
+        host_surface_key);
+  }
+
   return true;
 }
 
@@ -1773,6 +1881,7 @@ void D3D12TextureCache::UpdateTextureBindingsImpl(
     if (!binding) {
       continue;
     }
+    bool guest_declares_signed = binding->key.signed_mask != 0;
     if (IsSignedVersionSeparateForFormat(binding->key)) {
       if (binding->texture &&
           texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
@@ -1780,7 +1889,7 @@ void D3D12TextureCache::UpdateTextureBindingsImpl(
             *static_cast<D3D12Texture*>(binding->texture), false,
             binding->host_swizzle);
       }
-      if (binding->texture_signed &&
+      if (guest_declares_signed && binding->texture_signed &&
           texture_util::IsAnySignSigned(binding->swizzled_signs)) {
         d3d12_binding.descriptor_index_signed = FindOrCreateTextureDescriptor(
             *static_cast<D3D12Texture*>(binding->texture_signed), true,
@@ -1789,23 +1898,28 @@ void D3D12TextureCache::UpdateTextureBindingsImpl(
     } else {
       D3D12Texture* texture = static_cast<D3D12Texture*>(binding->texture);
       if (texture) {
-        if (texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
-          d3d12_binding.descriptor_index = FindOrCreateTextureDescriptor(
-              *texture, false, binding->host_swizzle);
-        }
-        if (texture_util::IsAnySignSigned(binding->swizzled_signs)) {
-          d3d12_binding.descriptor_index_signed = FindOrCreateTextureDescriptor(
-              *texture, true, binding->host_swizzle);
-        }
+      if (texture_util::IsAnySignNotSigned(binding->swizzled_signs)) {
+        d3d12_binding.descriptor_index = FindOrCreateTextureDescriptor(
+            *texture, false, binding->host_swizzle);
+      }
+      if (guest_declares_signed &&
+          texture_util::IsAnySignSigned(binding->swizzled_signs)) {
+        d3d12_binding.descriptor_index_signed = FindOrCreateTextureDescriptor(
+            *texture, true, binding->host_swizzle);
       }
     }
+  }
   }
 }
 
 uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
     D3D12Texture& texture, bool is_signed, uint32_t host_swizzle) {
+  TextureKey texture_key = texture.key();
+  bool host_declares_signed = texture_key.signed_mask != 0;
+  bool use_signed_view = is_signed && host_declares_signed;
+
   D3D12Texture::SRVDescriptorKey descriptor_key;
-  descriptor_key.is_signed = uint32_t(is_signed);
+  descriptor_key.is_signed = uint32_t(use_signed_view);
   descriptor_key.host_swizzle = host_swizzle;
 
   // Try to find an existing descriptor.
@@ -1815,18 +1929,15 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
     return existing_descriptor_index;
   }
 
-  TextureKey texture_key = texture.key();
-
   // Create a new bindless or cached descriptor if supported.
   D3D12_SHADER_RESOURCE_VIEW_DESC desc;
-
   if (IsSignedVersionSeparateForFormat(texture_key) &&
       texture_key.signed_separate != uint32_t(is_signed)) {
     // Not the version with the needed signedness.
     return UINT32_MAX;
   }
   xenos::TextureFormat format = texture_key.format;
-  if (is_signed) {
+  if (use_signed_view) {
     // Not supporting signed compressed textures - hopefully DXN and DXT5A are
     // not used as signed.
     desc.Format = host_formats_[uint32_t(format)].dxgi_format_signed;
@@ -1959,6 +2070,445 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
+                                            bool load_base,
+                                            bool /*load_mips*/) {
+  if (!load_base) {
+    return true;
+  }
+
+  const TextureKey& key = texture.key();
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  if (width == 0 || height == 0) {
+    return false;
+  }
+
+  uint64_t pixel_count = uint64_t(width) * uint64_t(height);
+  uint64_t alpha_plane_size = pixel_count * 2u;
+  uint64_t rgb_plane_size = pixel_count * 3u;
+  uint64_t total_size = alpha_plane_size + rgb_plane_size;
+
+  if (alpha_plane_size == 0 || rgb_plane_size == 0 ||
+      alpha_plane_size > UINT32_MAX || rgb_plane_size > UINT32_MAX ||
+      total_size > UINT32_MAX) {
+    return false;
+  }
+
+  uint32_t base_address = key.base_page << 12;
+  uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
+  if (uint64_t(base_address) > buffer_size_bytes ||
+      total_size > buffer_size_bytes ||
+      uint64_t(base_address) + total_size > buffer_size_bytes) {
+    return false;
+  }
+
+  uint32_t alpha_plane_size32 = uint32_t(alpha_plane_size);
+  uint32_t total_size32 = uint32_t(total_size);
+  if (!shared_memory().RequestRange(base_address,
+                                    xe::align(total_size32, uint32_t(16)),
+                                    nullptr)) {
+    return false;
+  }
+  const auto& d3d12_shared_memory =
+      static_cast<const D3D12SharedMemory&>(shared_memory());
+  const uint8_t* alpha_src =
+      d3d12_shared_memory.TranslatePhysical(base_address);
+  if (!alpha_src) {
+    return false;
+  }
+  const uint8_t* rgb_src =
+      d3d12_shared_memory.TranslatePhysical(base_address + alpha_plane_size32);
+  if (!rgb_src) {
+    return false;
+  }
+
+  std::vector<uint8_t> rgba(pixel_count * 4u);
+  for (uint64_t i = 0; i < pixel_count; ++i) {
+    uint16_t alpha_word;
+    std::memcpy(&alpha_word, alpha_src + i * 2u, sizeof(alpha_word));
+    alpha_word = xenos::GpuSwap(alpha_word, key.endianness);
+    uint8_t alpha_value = kDogAlphaUseHighByte
+                              ? static_cast<uint8_t>(alpha_word >> 8)
+                              : static_cast<uint8_t>(alpha_word & 0xFF);
+
+    const uint8_t* rgb = rgb_src + i * 3u;
+    uint64_t dst = i * 4u;
+    rgba[dst + 0] = rgb[0];
+    rgba[dst + 1] = rgb[1];
+    rgba[dst + 2] = rgb[2];
+    rgba[dst + 3] = alpha_value;
+  }
+
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  DXGI_FORMAT dxgi_format =
+      key.signed_mask == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM
+                           : DXGI_FORMAT_R8G8B8A8_SNORM;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  UINT num_rows = 0;
+  UINT64 row_size_bytes = 0;
+  UINT64 upload_size = 0;
+  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
+  texture_desc.Format = dxgi_format;
+  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
+                                &row_size_bytes, &upload_size);
+  if (num_rows == 0 || upload_size == 0) {
+    return false;
+  }
+
+  D3D12_RESOURCE_DESC upload_desc;
+  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&upload_buffer)))) {
+    return false;
+  }
+
+  uint8_t* upload_mapping = nullptr;
+  D3D12_RANGE read_range;
+  read_range.Begin = 0;
+  read_range.End = 0;
+  if (FAILED(upload_buffer->Map(
+          0, &read_range, reinterpret_cast<void**>(&upload_mapping)))) {
+    return false;
+  }
+  uint8_t* upload_data = upload_mapping + footprint.Offset;
+  size_t src_row_bytes = size_t(width) * 4u;
+  for (UINT row = 0; row < num_rows; ++row) {
+    uint8_t* dst_row =
+        upload_data + row * footprint.Footprint.RowPitch;
+    const uint8_t* src_row =
+        rgba.data() + size_t(row) * src_row_bytes;
+    std::memcpy(dst_row, src_row, src_row_bytes);
+    size_t padding =
+        footprint.Footprint.RowPitch > src_row_bytes
+            ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+            : 0u;
+    if (padding) {
+      std::memset(dst_row + src_row_bytes, 0, padding);
+    }
+  }
+  D3D12_RANGE written_range;
+  written_range.Begin = footprint.Offset;
+  written_range.End =
+      footprint.Offset +
+      num_rows * footprint.Footprint.RowPitch;
+  upload_buffer->Unmap(0, &written_range);
+
+  texture.MarkAsUsed();
+
+  ID3D12Resource* texture_resource = texture.resource();
+  command_processor_.PushTransitionBarrier(
+      texture_resource,
+      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(
+      upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+
+  D3D12_TEXTURE_COPY_LOCATION source_location;
+  source_location.pResource = upload_buffer.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source_location.PlacedFootprint = footprint;
+
+  D3D12_TEXTURE_COPY_LOCATION dest_location;
+  dest_location.pResource = texture_resource;
+  dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dest_location.SubresourceIndex = 0;
+
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &dest_location, 0, 0, 0, &source_location, nullptr);
+
+  command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+  command_processor_.PushTransitionBarrier(
+      texture_resource,
+      texture.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+
+  return true;
+}
+
+bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
+                                                bool load_base,
+                                                bool /*load_mips*/) {
+  if (!load_base) {
+    return true;
+  }
+
+  const TextureKey& key = texture.key();
+  uint32_t component_count = GetComponentCountForPlain16Bit(key.format);
+  if (component_count == 0) {
+    return false;
+  }
+
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  if (width == 0 || height == 0) {
+    return false;
+  }
+
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  const texture_util::TextureGuestLayout::Level& base_layout = layout.base;
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (bytes_per_block == 0) {
+    return false;
+  }
+
+  uint32_t row_pitch_bytes = base_layout.row_pitch_bytes;
+  if (row_pitch_bytes == 0) {
+    return false;
+  }
+  uint32_t pitch_blocks = row_pitch_bytes / bytes_per_block;
+  uint32_t bytes_per_block_log2 = xe::log2_floor(bytes_per_block);
+  uint32_t bytes_per_texel = component_count * sizeof(uint16_t);
+
+  uint32_t base_address = key.base_page << 12;
+  uint32_t base_size = base_layout.array_slice_data_extent_bytes;
+  if (base_size == 0) {
+    base_size = row_pitch_bytes * height;
+  }
+  if (!shared_memory().RequestRange(
+          base_address, xe::align(base_size, uint32_t(16)), nullptr)) {
+    return false;
+  }
+  const auto& d3d12_shared_memory =
+      static_cast<const D3D12SharedMemory&>(shared_memory());
+  const uint8_t* base_ptr =
+      d3d12_shared_memory.TranslatePhysical(base_address);
+  if (!base_ptr) {
+    return false;
+  }
+
+  std::vector<uint16_t> staging(width * height * component_count);
+  using DirectX::PackedVector::XMConvertFloatToHalf;
+
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* texel_ptr;
+      if (!key.tiled) {
+        texel_ptr = base_ptr + uint64_t(y) * row_pitch_bytes +
+                    uint64_t(x) * bytes_per_texel;
+      } else {
+        uint32_t offset = uint32_t(texture_util::GetTiledOffset2D(
+            int32_t(x), int32_t(y), pitch_blocks, bytes_per_block_log2));
+        texel_ptr = base_ptr + offset;
+      }
+      size_t staging_index =
+          (size_t(y) * width + x) * component_count;
+      for (uint32_t component = 0; component < component_count; ++component) {
+        uint16_t raw_component;
+        std::memcpy(&raw_component,
+                    texel_ptr + component * sizeof(uint16_t),
+                    sizeof(raw_component));
+        raw_component = xenos::GpuSwap(raw_component, key.endianness);
+        float normalized;
+        if (((key.signed_mask >> component) & 0x1) != 0) {
+          normalized =
+              std::clamp(static_cast<float>(static_cast<int16_t>(raw_component)) /
+                             32767.0f,
+                         -1.0f, 1.0f);
+        } else {
+          normalized = static_cast<float>(raw_component) / 65535.0f;
+        }
+        staging[staging_index + component] =
+            XMConvertFloatToHalf(normalized);
+      }
+    }
+  }
+
+  DXGI_FORMAT dxgi_format;
+  switch (component_count) {
+    case 1:
+      dxgi_format = DXGI_FORMAT_R16_FLOAT;
+      break;
+    case 2:
+      dxgi_format = DXGI_FORMAT_R16G16_FLOAT;
+      break;
+    case 4:
+      dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      break;
+    default:
+      return false;
+  }
+
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  UINT num_rows = 0;
+  UINT64 row_size_bytes = 0;
+  UINT64 upload_size = 0;
+  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
+  texture_desc.Format = dxgi_format;
+  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
+                                &row_size_bytes, &upload_size);
+  if (num_rows == 0 || upload_size == 0) {
+    return false;
+  }
+
+  D3D12_RESOURCE_DESC upload_desc;
+  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&upload_buffer)))) {
+    return false;
+  }
+
+  uint8_t* upload_mapping = nullptr;
+  D3D12_RANGE read_range{};
+  if (FAILED(upload_buffer->Map(
+          0, &read_range, reinterpret_cast<void**>(&upload_mapping)))) {
+    return false;
+  }
+  uint8_t* upload_data = upload_mapping + footprint.Offset;
+  size_t src_row_bytes = size_t(width) * component_count * sizeof(uint16_t);
+  for (UINT row = 0; row < num_rows; ++row) {
+    uint8_t* dst_row =
+        upload_data + row * footprint.Footprint.RowPitch;
+    const uint8_t* src_row =
+        reinterpret_cast<const uint8_t*>(staging.data()) +
+        size_t(row) * src_row_bytes;
+    std::memcpy(dst_row, src_row, src_row_bytes);
+    size_t padding =
+        footprint.Footprint.RowPitch > src_row_bytes
+            ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+            : 0u;
+    if (padding) {
+      std::memset(dst_row + src_row_bytes, 0, padding);
+    }
+  }
+  D3D12_RANGE written_range;
+  written_range.Begin = footprint.Offset;
+  written_range.End =
+      footprint.Offset +
+      num_rows * footprint.Footprint.RowPitch;
+  upload_buffer->Unmap(0, &written_range);
+
+  texture.MarkAsUsed();
+
+  ID3D12Resource* texture_resource = texture.resource();
+  command_processor_.PushTransitionBarrier(
+      texture_resource,
+      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(
+      upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+
+  D3D12_TEXTURE_COPY_LOCATION source_location;
+  source_location.pResource = upload_buffer.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source_location.PlacedFootprint = footprint;
+
+  D3D12_TEXTURE_COPY_LOCATION dest_location;
+  dest_location.pResource = texture_resource;
+  dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dest_location.SubresourceIndex = 0;
+
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &dest_location, 0, 0, 0, &source_location, nullptr);
+
+  command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+  command_processor_.PushTransitionBarrier(
+      texture_resource,
+      texture.SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+
+  return true;
+}
+
+void D3D12TextureCache::InvalidateHostSurfaceBindings(
+    uint32_t base_page, xenos::TextureFormat format, uint32_t width,
+    uint32_t height, uint8_t signed_mask) {
+  uint32_t cleared_bindings = 0;
+  const uint32_t binding_count = uint32_t(texture_bindings_.size());
+  for (uint32_t i = 0; i < binding_count; ++i) {
+    TextureBinding& binding = texture_bindings_[i];
+    if (!binding.key.is_valid || !binding.key.host_repacked) {
+      continue;
+    }
+    if (binding.key.base_page != base_page ||
+        binding.key.format != format ||
+        binding.key.GetWidth() != width ||
+        binding.key.GetHeight() != height ||
+        binding.key.signed_mask != signed_mask) {
+      continue;
+    }
+
+    const xenos::DataDimension dimension = binding.key.dimension;
+    D3D12TextureBinding& d3d12_binding = d3d12_texture_bindings_[i];
+
+    uint32_t descriptor_index_unsigned = d3d12_binding.descriptor_index;
+    uint32_t descriptor_index_signed = d3d12_binding.descriptor_index_signed;
+    if (descriptor_index_unsigned != UINT32_MAX) {
+      WriteNullSRVDescriptor(descriptor_index_unsigned, dimension);
+    }
+    if (descriptor_index_signed != UINT32_MAX &&
+        descriptor_index_signed != descriptor_index_unsigned) {
+      WriteNullSRVDescriptor(descriptor_index_signed, dimension);
+    }
+
+    binding.Reset();
+    d3d12_binding.Reset();
+    cleared_bindings |= UINT32_C(1) << i;
+  }
+  if (cleared_bindings != 0) {
+    texture_bindings_in_sync_ &= ~cleared_bindings;
+  }
+}
+
+void D3D12TextureCache::WriteNullSRVDescriptor(
+    uint32_t descriptor_index, xenos::DataDimension dimension) {
+  if (descriptor_index == UINT32_MAX) {
+    return;
+  }
+  NullSRVDescriptorIndex null_descriptor_index =
+      NullSRVDescriptorIndex::k2DArray;
+  switch (dimension) {
+    case xenos::DataDimension::k3D:
+      null_descriptor_index = NullSRVDescriptorIndex::k3D;
+      break;
+    case xenos::DataDimension::kCube:
+      null_descriptor_index = NullSRVDescriptorIndex::kCube;
+      break;
+    default:
+      null_descriptor_index = NullSRVDescriptorIndex::k2DArray;
+      break;
+  }
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  D3D12_CPU_DESCRIPTOR_HANDLE source_handle = provider.OffsetViewDescriptor(
+      null_srv_descriptor_heap_start_, uint32_t(null_descriptor_index));
+  D3D12_CPU_DESCRIPTOR_HANDLE dest_handle =
+      GetTextureDescriptorCPUHandle(descriptor_index);
+  provider.GetDevice()->CopyDescriptorsSimple(
+      1, dest_handle, source_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
 }  // namespace d3d12

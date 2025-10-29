@@ -334,6 +334,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    AdjustHostRepackForKey(binding.key);
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
@@ -352,15 +353,22 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     bool key_changed = binding.key != old_key;
     bool any_sign_was_not_signed =
         texture_util::IsAnySignNotSigned(old_swizzled_signs);
+    bool guest_declared_signed_before = old_key.is_valid &&
+                                        old_key.signed_mask != 0;
     bool any_sign_was_signed =
         texture_util::IsAnySignSigned(old_swizzled_signs);
+    bool any_sign_was_signed_effective =
+        any_sign_was_signed && guest_declared_signed_before;
     bool any_sign_is_not_signed =
         texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed =
         texture_util::IsAnySignSigned(binding.swizzled_signs);
+    bool guest_declares_signed = binding.key.signed_mask != 0;
+    bool any_sign_is_signed_effective =
+        any_sign_is_signed && guest_declares_signed;
     if (key_changed || binding.host_swizzle != old_host_swizzle ||
         any_sign_is_not_signed != any_sign_was_not_signed ||
-        any_sign_is_signed != any_sign_was_signed) {
+        any_sign_is_signed_effective != any_sign_was_signed_effective) {
       bindings_changed |= index_bit;
     }
     bool load_unsigned_data = false, load_signed_data = false;
@@ -379,8 +387,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       } else {
         binding.texture = nullptr;
       }
-      if (any_sign_is_signed) {
-        if (key_changed || !any_sign_was_signed) {
+      if (any_sign_is_signed_effective) {
+        if (key_changed || !any_sign_was_signed_effective) {
           TextureKey signed_key = binding.key;
           signed_key.signed_separate = 1;
           binding.texture_signed = FindOrCreateTexture(signed_key);
@@ -579,6 +587,7 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+  AdjustHostRepackForKey(key);
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled &&
       IsScaledResolveSupportedForFormat(key)) {
@@ -941,12 +950,82 @@ void TextureCache::BindingInfoFromFetchConstant(
   key_out.packed_mips = fetch.packed_mips;
   key_out.format = format;
   key_out.endianness = fetch.endianness;
+  key_out.host_repacked = 0;
+  uint32_t signed_mask = 0;
+  if (fetch.sign_x == xenos::TextureSign::kSigned) {
+    signed_mask |= 1u << 0;
+  }
+  if (fetch.sign_y == xenos::TextureSign::kSigned) {
+    signed_mask |= 1u << 1;
+  }
+  if (fetch.sign_z == xenos::TextureSign::kSigned) {
+    signed_mask |= 1u << 2;
+  }
+  if (fetch.sign_w == xenos::TextureSign::kSigned) {
+    signed_mask |= 1u << 3;
+  }
+  key_out.signed_mask = signed_mask;
 
   key_out.is_valid = 1;
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
   }
+
+  switch (format) {
+    case xenos::TextureFormat::k_8_8_8_8_A:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16:
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      key_out.host_repacked = 1;
+      break;
+    default:
+      break;
+  }
+}
+
+void TextureCache::AdjustHostRepackForKey(TextureKey& /*key*/) {
+}
+
+void TextureCache::InvalidateHostSurfaceBindings(uint32_t base_page,
+                                                 xenos::TextureFormat format,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 uint8_t signed_mask) {
+  uint32_t bindings_reset = 0;
+  for (size_t i = 0; i < texture_bindings_.size(); ++i) {
+    TextureBinding& binding = texture_bindings_[i];
+    if (!binding.key.is_valid) {
+      continue;
+    }
+    const TextureKey& key = binding.key;
+    if (key.base_page != base_page) {
+      continue;
+    }
+    if (key.format != format) {
+      continue;
+    }
+    if (key.GetWidth() != width || key.GetHeight() != height) {
+      continue;
+    }
+    if (key.signed_mask != signed_mask) {
+      continue;
+    }
+    if (!key.host_repacked) {
+      continue;
+    }
+    binding.Reset();
+    bindings_reset |= UINT32_C(1) << i;
+  }
+
+  if (!bindings_reset) {
+    return;
+  }
+  texture_bindings_in_sync_ &= ~bindings_reset;
+  UpdateTextureBindingsImpl(bindings_reset);
 }
 
 void TextureCache::ResetTextureBindings(bool from_destructor) {

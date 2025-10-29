@@ -135,6 +135,16 @@ void D3D12CommandProcessor::SubmitBarriers() {
   }
 }
 
+void D3D12CommandProcessor::RetainResourceForSubmission(
+    ID3D12Resource* resource) {
+  assert_true(submission_open_);
+  if (!resource) {
+    return;
+  }
+  resource->AddRef();
+  resources_for_deletion_.emplace_back(submission_current_, resource);
+}
+
 ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(
     const DxbcShader* vertex_shader, const DxbcShader* pixel_shader,
     bool tessellated) {

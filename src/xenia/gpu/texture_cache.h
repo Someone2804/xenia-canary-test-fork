@@ -115,6 +115,11 @@ class TextureCache {
     texture_bindings_in_sync_ &= ~res;
   }
 
+  virtual void InvalidateHostSurfaceBindings(uint32_t base_page,
+                                             xenos::TextureFormat format,
+                                             uint32_t width, uint32_t height,
+                                             uint8_t signed_mask);
+
   virtual void RequestTextures(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.
@@ -169,16 +174,21 @@ class TextureCache {
     uint32_t depth_or_array_size_minus_1 : 10;  // 74
     uint32_t pitch : 9;                         // 83
     uint32_t mip_max_level : 4;                 // 87
-    xenos::TextureFormat format : 6;            // 93
-    xenos::Endian endianness : 2;               // 95
+    xenos::TextureFormat format : 6;  // 93
+    xenos::Endian endianness : 2;     // 95
+    // Bit mask of channels that are declared signed in the guest texture fetch
+    // constant (bit 0 - X, 1 - Y, 2 - Z, 3 - W).
+    uint32_t signed_mask : 4;  // 99
+    // Whether the CPU has repacked this texture into an alternate host format.
+    uint32_t host_repacked : 1;  // 100
     // Whether this texture is signed and has a different host representation
     // than an unsigned view of the same guest texture.
-    uint32_t signed_separate : 1;  // 96
+    uint32_t signed_separate : 1;  // 101
 
     // Whether this texture is a resolution-scaled resolve target.
-    uint32_t scaled_resolve : 1;  // 97
+    uint32_t scaled_resolve : 1;  // 102
     // Least important in ==, so placed last.
-    uint32_t is_valid : 1;  // 98
+    uint32_t is_valid : 1;  // 103
 
     TextureKey() { MakeInvalid(); }
     TextureKey(const TextureKey& key) {
@@ -217,6 +227,8 @@ class TextureCache {
     }
     void LogAction(const char* action) const;
   };
+
+  virtual void AdjustHostRepackForKey(TextureKey& key);
 
   class Texture {
    public:
@@ -656,6 +668,7 @@ class TextureCache {
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
 
+ protected:
   std::array<TextureBinding, xenos::kTextureFetchConstantCount>
       texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch

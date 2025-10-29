@@ -11,6 +11,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
+
+#include <DirectXPackedVector.h>
 
 #include "third_party/dxbc/DXBCChecksum.h"
 #include "third_party/fmt/include/fmt/xchar.h"
@@ -27,6 +30,7 @@
 #include "xenia/gpu/dxbc.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
@@ -69,6 +73,42 @@ DEFINE_string(
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+namespace {
+constexpr bool kDogAlphaUseHighByte = true;
+
+static xenos::ColorRenderTargetFormat GetMorphRenderTargetFormatForTexture(
+    xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8_8_8_8_A:
+      return xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_16:
+      return xenos::ColorRenderTargetFormat::k_16_16;
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      return xenos::ColorRenderTargetFormat::k_16_16_FLOAT;
+    case xenos::TextureFormat::k_16_16_16_16:
+      return xenos::ColorRenderTargetFormat::k_16_16_16_16;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      return xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT;
+    default:
+      return xenos::ColorRenderTargetFormat::k_8_8_8_8;
+  }
+}
+
+static xenos::SurfaceNumberFormat GetMorphSurfaceNumberFormatFromTexture(
+    xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      return xenos::SurfaceNumberFormat::kFloat;
+    default:
+      return xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+  }
+}
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -139,6 +179,109 @@ constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
 };
 
+RenderTargetCache::RenderTargetKey
+D3D12RenderTargetCache::CanonicalizeHostSurfaceRenderTargetKey(
+    RenderTargetCache::RenderTargetKey key) {
+  key.host_repacked = 0;
+  return key;
+}
+
+bool D3D12RenderTargetCache::IsMorphResolveFormat(xenos::ColorFormat format) {
+  switch (format) {
+    case xenos::ColorFormat::k_8_8_8_8_A:
+    case xenos::ColorFormat::k_16:
+    case xenos::ColorFormat::k_16_16:
+    case xenos::ColorFormat::k_16_16_16_16:
+    case xenos::ColorFormat::k_16_FLOAT:
+    case xenos::ColorFormat::k_16_16_FLOAT:
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool D3D12RenderTargetCache::IsMorphTextureFormat(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8_8_8_8_A:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16:
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+uint8_t D3D12RenderTargetCache::GetMorphFormatSignedMask(
+    xenos::TextureFormat format, xenos::SurfaceNumberFormat number) {
+  uint8_t component_count = 0;
+  switch (format) {
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_FLOAT:
+      component_count = 1;
+      break;
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      component_count = 2;
+      break;
+    case xenos::TextureFormat::k_16_16_16_16:
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case xenos::TextureFormat::k_8_8_8_8_A:
+      component_count = 4;
+      break;
+    default:
+      break;
+  }
+  if (!component_count) {
+    return 0;
+  }
+  if (number == xenos::SurfaceNumberFormat::kSignedRepeatingFraction ||
+      number == xenos::SurfaceNumberFormat::kSignedInteger) {
+    return static_cast<uint8_t>((uint32_t(1) << component_count) - 1);
+  }
+  return 0;
+}
+
+bool D3D12RenderTargetCache::IsMorphRenderTargetFormat(
+    xenos::ColorRenderTargetFormat format) {
+  switch (format) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+    case xenos::ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+xenos::TextureFormat
+D3D12RenderTargetCache::GetMorphTextureFormatFromRenderTarget(
+    xenos::ColorRenderTargetFormat format) {
+  switch (format) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+      return xenos::TextureFormat::k_8_8_8_8_A;
+    case xenos::ColorRenderTargetFormat::k_16_16:
+      return xenos::TextureFormat::k_16_16;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+      return xenos::TextureFormat::k_16_16_16_16;
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      return xenos::TextureFormat::k_16_16_FLOAT;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+      return xenos::TextureFormat::k_16_16_16_16_FLOAT;
+    default:
+      assert_unhandled_case(format);
+      return xenos::TextureFormat::k_8_8_8_8_A;
+  }
+}
+
 constexpr uint32_t D3D12RenderTargetCache::kTransferUsedRootParameters[size_t(
     TransferRootSignatureIndex::kCount)] = {
     // kColor
@@ -208,6 +351,11 @@ constexpr D3D12RenderTargetCache::TransferModeInfo
 };
 
 D3D12RenderTargetCache::~D3D12RenderTargetCache() { Shutdown(true); }
+
+void D3D12RenderTargetCache::ClearCache() {
+  ClearHostSurfaces();
+  RenderTargetCache::ClearCache();
+}
 
 bool D3D12RenderTargetCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider =
@@ -1110,6 +1258,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  ClearHostSurfaces();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1179,6 +1328,912 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
     ShutdownCommon();
   }
 }
+
+void D3D12RenderTargetCache::ClearHostSurfaces() {
+  for (auto& render_target_pair : host_surfaces_by_render_target_) {
+    RemoveHostSurface(render_target_pair.second.get());
+  }
+  host_surfaces_by_render_target_.clear();
+  host_surfaces_by_texture_.clear();
+  host_surfaces_by_base_page_.clear();
+  host_surface_metadata_.clear();
+}
+
+void D3D12RenderTargetCache::RemoveHostSurface(HostSurface* surface) {
+  if (!surface) {
+    return;
+  }
+  if (surface->texture_registered) {
+    if (surface->texture_key.base_page) {
+      auto base_it =
+          host_surfaces_by_base_page_.find(surface->texture_key.base_page);
+      if (base_it != host_surfaces_by_base_page_.end() &&
+          base_it->second == surface) {
+        host_surfaces_by_base_page_.erase(base_it);
+      }
+    }
+    host_surfaces_by_texture_.erase(surface->texture_key);
+    surface->texture_registered = false;
+  }
+  if (surface->render_target) {
+    SetRenderTargetForKey(surface->render_target_key, nullptr);
+    surface->render_target = nullptr;
+  }
+  surface->resource.Reset();
+  surface->shared_state = nullptr;
+  surface->seeded = false;
+}
+
+D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
+    RenderTargetKey key, uint32_t width_pixels, uint32_t height_pixels) {
+  RenderTargetKey canonical_key = CanonicalizeHostSurfaceRenderTargetKey(key);
+  auto it = host_surfaces_by_render_target_.find(canonical_key);
+  if (it != host_surfaces_by_render_target_.end()) {
+    HostSurface* existing = it->second.get();
+    if (existing && existing->render_target) {
+      SetRenderTargetForKey(canonical_key, existing->render_target);
+      existing->rtv_format = existing->render_target->rtv_format();
+      return existing;
+    }
+  }
+
+  uint32_t width = std::max<uint32_t>(1, width_pixels);
+  uint32_t height = std::max<uint32_t>(1, height_pixels);
+
+  DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT srv_default_format = DXGI_FORMAT_UNKNOWN;
+  switch (key.GetColorFormat()) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+      resource_format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+      rtv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      srv_default_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      break;
+    case xenos::ColorRenderTargetFormat::k_16_16:
+      resource_format = DXGI_FORMAT_R16G16_FLOAT;
+      rtv_format = resource_format;
+      srv_default_format = resource_format;
+      break;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+      resource_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      rtv_format = resource_format;
+      srv_default_format = resource_format;
+      break;
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      resource_format = DXGI_FORMAT_R16G16_FLOAT;
+      rtv_format = resource_format;
+      srv_default_format = resource_format;
+      break;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+      resource_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      rtv_format = resource_format;
+      srv_default_format = resource_format;
+      break;
+    default:
+      assert_unhandled_case(key.GetColorFormat());
+      return nullptr;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  D3D12_RESOURCE_DESC resource_desc;
+  resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  resource_desc.Alignment = 0;
+  resource_desc.Width = width;
+  resource_desc.Height = height;
+  resource_desc.DepthOrArraySize = 1;
+  resource_desc.MipLevels = 1;
+  resource_desc.Format = resource_format;
+  if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported()) {
+    resource_desc.SampleDesc.Count = 4;
+  } else {
+    resource_desc.SampleDesc.Count = UINT(1) << UINT(key.msaa_samples);
+  }
+  resource_desc.SampleDesc.Quality = 0;
+  resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+  D3D12_CLEAR_VALUE clear_value;
+  clear_value.Format = rtv_format;
+  clear_value.Color[0] = 0.0f;
+  clear_value.Color[1] = 0.0f;
+  clear_value.Color[2] = 0.0f;
+  clear_value.Color[3] = 0.0f;
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+          &resource_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear_value,
+          IID_PPV_ARGS(&resource)))) {
+    return nullptr;
+  }
+  {
+    std::u16string resource_name = xe::to_utf16(key.GetDebugName());
+    resource->SetName(reinterpret_cast<LPCWSTR>(resource_name.c_str()));
+  }
+
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw =
+      descriptor_pool_color_->AllocateDescriptor();
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv =
+      descriptor_pool_srv_->AllocateDescriptor();
+  if (!descriptor_draw.IsValid() || !descriptor_srv.IsValid()) {
+    return nullptr;
+  }
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw_srgb;
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_load;
+  ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv_stencil;
+
+  D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+  rtv_desc.Format = rtv_format;
+  if (resource_desc.SampleDesc.Count > 1) {
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+  } else {
+    rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtv_desc.Texture2D.MipSlice = 0;
+    rtv_desc.Texture2D.PlaneSlice = 0;
+  }
+  device->CreateRenderTargetView(resource.Get(), &rtv_desc,
+                                 descriptor_draw.GetHandle());
+
+  DXGI_FORMAT ownership_format =
+      GetColorOwnershipTransferDXGIFormat(key.GetColorFormat());
+  if (ownership_format != rtv_format) {
+    descriptor_load = descriptor_pool_color_->AllocateDescriptor();
+    if (!descriptor_load.IsValid()) {
+      return nullptr;
+    }
+    rtv_desc.Format = ownership_format;
+    device->CreateRenderTargetView(resource.Get(), &rtv_desc,
+                                   descriptor_load.GetHandle());
+    rtv_desc.Format = rtv_format;
+  }
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  if (resource_desc.SampleDesc.Count > 1) {
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+  } else {
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    srv_desc.Texture2D.MipLevels = 1;
+    srv_desc.Texture2D.PlaneSlice = 0;
+    srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+  }
+  srv_desc.Format = srv_default_format;
+  device->CreateShaderResourceView(resource.Get(), &srv_desc,
+                                   descriptor_srv.GetHandle());
+
+  auto surface = std::make_unique<HostSurface>();
+  surface->texture_key.base_page = 0;
+  surface->texture_key.texture_format =
+      GetMorphTextureFormatFromRenderTarget(key.GetColorFormat());
+  surface->texture_key.width = width;
+  surface->texture_key.height = height;
+  surface->texture_key.signed_mask = 0;
+  surface->render_target_key = canonical_key;
+  surface->resource = resource;
+  surface->resource_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  surface->shared_state = &surface->resource_state;
+  surface->width = width;
+  surface->height = height;
+  surface->number_format =
+      xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+  surface->signed_mask = 0;
+  surface->texture_registered = false;
+  surface->seeded = false;
+  surface->rtv_format = rtv_format;
+  surface->render_target = new D3D12RenderTarget(
+      key, resource.Get(), rtv_format, std::move(descriptor_draw),
+      std::move(descriptor_draw_srgb), std::move(descriptor_load),
+      std::move(descriptor_srv), std::move(descriptor_srv_stencil),
+      surface->resource_state, surface->shared_state);
+
+  HostSurface* surface_ptr = surface.get();
+  host_surfaces_by_render_target_.emplace(canonical_key, std::move(surface));
+  SetRenderTargetForKey(canonical_key, surface_ptr->render_target);
+  return surface_ptr;
+}
+
+void D3D12RenderTargetCache::TransitionRenderTargetToState(
+    D3D12RenderTarget& render_target,
+    D3D12_RESOURCE_STATES new_state) {
+  D3D12_RESOURCE_STATES old_state = render_target.SetResourceState(new_state);
+  if (old_state == new_state) {
+    return;
+  }
+  command_processor_.PushTransitionBarrier(render_target.resource(), old_state,
+                                           new_state);
+
+  auto host_surface_it = host_surfaces_by_render_target_.find(
+      CanonicalizeHostSurfaceRenderTargetKey(render_target.key()));
+  if (host_surface_it != host_surfaces_by_render_target_.end()) {
+    HostSurface* host_surface = host_surface_it->second.get();
+    if (host_surface) {
+      if (host_surface->shared_state) {
+        *host_surface->shared_state = new_state;
+      }
+      host_surface->resource_state = new_state;
+      if (host_surface->texture_registered && host_surface->seeded) {
+        static uint32_t morph_transition_log_count = 0;
+        if (morph_transition_log_count < 64) {
+          ++morph_transition_log_count;
+          XELOGGPU(
+              "Morph host surface transition base_page=0x{:05X} format={} "
+              "{:08X}->{:08X}",
+              host_surface->texture_key.base_page,
+              uint32_t(host_surface->texture_key.texture_format),
+              static_cast<uint32_t>(old_state),
+              static_cast<uint32_t>(new_state));
+        }
+      }
+    }
+  }
+}
+
+bool D3D12RenderTargetCache::CreateAndSeedHostSurfaceFromResolve(
+    const HostSurfaceTextureKey& surface_key,
+    const HostSurfaceMetadata& metadata,
+    const draw_util::ResolveInfo& resolve_info,
+    D3D12SharedMemory& shared_memory) {
+  uint32_t width = surface_key.width;
+  uint32_t height = surface_key.height;
+  if (width == 0 || height == 0) {
+    return false;
+  }
+
+  HostSurface* surface =
+      EnsureHostSurface(metadata.render_target_key, width,
+                        height);
+  if (!surface || !surface->render_target) {
+    return false;
+  }
+
+  if (surface->texture_registered) {
+    if (surface->texture_key.base_page) {
+      auto base_it =
+          host_surfaces_by_base_page_.find(surface->texture_key.base_page);
+      if (base_it != host_surfaces_by_base_page_.end() &&
+          base_it->second == surface) {
+        host_surfaces_by_base_page_.erase(base_it);
+      }
+    }
+    host_surfaces_by_texture_.erase(surface->texture_key);
+    surface->texture_registered = false;
+  }
+  surface->texture_key = surface_key;
+  surface->texture_registered = true;
+  host_surfaces_by_texture_[surface->texture_key] = surface;
+  if (surface_key.base_page) {
+    host_surfaces_by_base_page_[surface_key.base_page] = surface;
+  }
+  surface->number_format = metadata.number_format;
+  surface->signed_mask = surface_key.signed_mask;
+
+  uint32_t base_address = surface_key.base_page << 12;
+  uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
+
+  const auto& d3d12_shared_memory =
+      static_cast<const D3D12SharedMemory&>(shared_memory);
+
+  xenos::Endian copy_endian;
+  switch (resolve_info.copy_dest_info.copy_dest_endian) {
+    case xenos::Endian128::k8in16:
+      copy_endian = xenos::Endian::k8in16;
+      break;
+    case xenos::Endian128::k8in32:
+      copy_endian = xenos::Endian::k8in32;
+      break;
+    case xenos::Endian128::k16in32:
+      copy_endian = xenos::Endian::k16in32;
+      break;
+    default:
+      copy_endian = xenos::Endian::kNone;
+      break;
+  }
+
+  D3D12RenderTarget& d3d12_rt = *surface->render_target;
+  ID3D12Resource* resource = d3d12_rt.resource();
+  if (!resource) {
+    return false;
+  }
+
+  TransitionRenderTargetToState(
+      d3d12_rt, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+
+  D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
+  DXGI_FORMAT resource_format = resource_desc.Format;
+  DXGI_FORMAT srv_format = resource_format;
+  if (resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+    srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  bool upload_success = false;
+  if (surface_key.texture_format == xenos::TextureFormat::k_8_8_8_8_A) {
+    uint64_t pixel_count = uint64_t(width) * uint64_t(height);
+    uint64_t alpha_plane_size = pixel_count * 2u;
+    uint64_t rgb_plane_size = pixel_count * 3u;
+    uint64_t total_size = alpha_plane_size + rgb_plane_size;
+    if (total_size == 0 || pixel_count == 0 ||
+        total_size > buffer_size_bytes ||
+        uint64_t(base_address) > buffer_size_bytes ||
+        uint64_t(base_address) + total_size > buffer_size_bytes) {
+      return false;
+    }
+    if (!shared_memory.RequestRange(
+            base_address, xe::align<uint32_t>(uint32_t(total_size), 16u),
+            nullptr)) {
+      return false;
+    }
+    const uint8_t* alpha_src =
+        d3d12_shared_memory.TranslatePhysical(base_address);
+    const uint8_t* rgb_src = d3d12_shared_memory.TranslatePhysical(
+        base_address + uint32_t(alpha_plane_size));
+    if (!alpha_src || !rgb_src) {
+      return false;
+    }
+
+    std::vector<uint8_t> rgba(pixel_count * 4u);
+    for (uint64_t i = 0; i < pixel_count; ++i) {
+      uint16_t alpha_word;
+      std::memcpy(&alpha_word, alpha_src + i * 2u, sizeof(alpha_word));
+      alpha_word = xenos::GpuSwap(alpha_word,
+                                  copy_endian);
+      uint8_t alpha_value = kDogAlphaUseHighByte
+                                ? static_cast<uint8_t>(alpha_word >> 8)
+                                : static_cast<uint8_t>(alpha_word & 0xFF);
+      const uint8_t* rgb = rgb_src + i * 3u;
+      uint64_t dst_index = i * 4u;
+      rgba[dst_index + 0] = rgb[0];
+      rgba[dst_index + 1] = rgb[1];
+      rgba[dst_index + 2] = rgb[2];
+      rgba[dst_index + 3] = alpha_value;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT num_rows = 0;
+    UINT64 row_size_bytes = 0;
+    UINT64 upload_size = 0;
+    D3D12_RESOURCE_DESC upload_desc = resource_desc;
+    upload_desc.Format = srv_format;
+    device->GetCopyableFootprints(&upload_desc, 0, 1, 0, &footprint, &num_rows,
+                                  &row_size_bytes, &upload_size);
+    if (num_rows == 0 || upload_size == 0) {
+      return false;
+    }
+
+    D3D12_RESOURCE_DESC upload_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(upload_buffer_desc, upload_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload,
+            command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+            &upload_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&upload_buffer)))) {
+      return false;
+    }
+
+    uint8_t* upload_mapping = nullptr;
+    D3D12_RANGE read_range{};
+    if (FAILED(upload_buffer->Map(
+            0, &read_range, reinterpret_cast<void**>(&upload_mapping)))) {
+      return false;
+    }
+    uint8_t* upload_data = upload_mapping + footprint.Offset;
+    size_t src_row_bytes = size_t(width) * 4u;
+    for (UINT row = 0; row < num_rows; ++row) {
+      uint8_t* dst_row =
+          upload_data + row * footprint.Footprint.RowPitch;
+      const uint8_t* src_row =
+          rgba.data() + size_t(row) * src_row_bytes;
+      std::memcpy(dst_row, src_row, src_row_bytes);
+      size_t padding = footprint.Footprint.RowPitch > src_row_bytes
+                           ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                           : 0u;
+      if (padding) {
+        std::memset(dst_row + src_row_bytes, 0, padding);
+      }
+    }
+    D3D12_RANGE written_range;
+    written_range.Begin = footprint.Offset;
+    written_range.End =
+        footprint.Offset +
+        num_rows * footprint.Footprint.RowPitch;
+    upload_buffer->Unmap(0, &written_range);
+
+    command_processor_.PushTransitionBarrier(
+        upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.SubmitBarriers();
+
+    D3D12_TEXTURE_COPY_LOCATION source_location;
+    source_location.pResource = upload_buffer.Get();
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source_location.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION dest_location;
+    dest_location.pResource = resource;
+    dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dest_location.SubresourceIndex = 0;
+
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &dest_location, 0, 0, 0, &source_location, nullptr);
+
+    command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+    upload_success = true;
+  } else {
+    uint32_t component_count = 0;
+    switch (surface_key.texture_format) {
+      case xenos::TextureFormat::k_16:
+      case xenos::TextureFormat::k_16_FLOAT:
+        component_count = 1;
+        break;
+      case xenos::TextureFormat::k_16_16:
+      case xenos::TextureFormat::k_16_16_FLOAT:
+        component_count = 2;
+        break;
+      case xenos::TextureFormat::k_16_16_16_16:
+      case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+        component_count = 4;
+        break;
+      default:
+        component_count = 0;
+        break;
+    }
+    if (component_count == 0) {
+      return false;
+    }
+
+    uint64_t bytes_per_texel = uint64_t(component_count) * sizeof(uint16_t);
+    uint32_t pitch_bytes =
+        resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32
+        << xenos::kTextureTileWidthHeightLog2;
+    uint32_t expected_pitch =
+        uint32_t(width) * uint32_t(bytes_per_texel);
+    if (pitch_bytes < expected_pitch) {
+      pitch_bytes = expected_pitch;
+    }
+    uint64_t total_size = uint64_t(pitch_bytes) * uint64_t(height);
+    if (total_size == 0 || total_size > buffer_size_bytes ||
+        uint64_t(base_address) > buffer_size_bytes ||
+        uint64_t(base_address) + total_size > buffer_size_bytes) {
+      return false;
+    }
+    if (!shared_memory.RequestRange(
+            base_address, xe::align<uint32_t>(uint32_t(total_size), 16u),
+            nullptr)) {
+      return false;
+    }
+    const uint8_t* base_ptr =
+        d3d12_shared_memory.TranslatePhysical(base_address);
+    if (!base_ptr) {
+      return false;
+    }
+
+    std::vector<uint16_t> staging(width * height * component_count);
+    using DirectX::PackedVector::XMConvertFloatToHalf;
+
+    for (uint32_t y = 0; y < height; ++y) {
+      const uint8_t* row_ptr = base_ptr + uint64_t(y) * pitch_bytes;
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint8_t* texel_ptr =
+            row_ptr + uint64_t(x) * bytes_per_texel;
+        size_t staging_index =
+            (size_t(y) * width + x) * component_count;
+        for (uint32_t component = 0; component < component_count; ++component) {
+          uint16_t raw_component;
+          std::memcpy(&raw_component,
+                      texel_ptr + component * sizeof(uint16_t),
+                      sizeof(raw_component));
+          raw_component = xenos::GpuSwap(
+              raw_component, copy_endian);
+          float normalized;
+          if (((surface_key.signed_mask >> component) & 0x1) != 0) {
+            normalized =
+                std::clamp(static_cast<float>(static_cast<int16_t>(raw_component)) /
+                               32767.0f,
+                           -1.0f, 1.0f);
+          } else {
+            normalized = static_cast<float>(raw_component) / 65535.0f;
+          }
+          staging[staging_index + component] =
+              XMConvertFloatToHalf(normalized);
+        }
+      }
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    UINT num_rows = 0;
+    UINT64 row_size_bytes = 0;
+    UINT64 upload_size = 0;
+    D3D12_RESOURCE_DESC upload_desc = resource_desc;
+    device->GetCopyableFootprints(&upload_desc, 0, 1, 0, &footprint,
+                                  &num_rows, &row_size_bytes, &upload_size);
+    if (num_rows == 0 || upload_size == 0) {
+      return false;
+    }
+
+    D3D12_RESOURCE_DESC upload_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(upload_buffer_desc, upload_size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload,
+            command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+            &upload_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&upload_buffer)))) {
+      return false;
+    }
+
+    uint8_t* upload_mapping = nullptr;
+    D3D12_RANGE read_range{};
+    if (FAILED(upload_buffer->Map(
+            0, &read_range, reinterpret_cast<void**>(&upload_mapping)))) {
+      return false;
+    }
+    uint8_t* upload_data = upload_mapping + footprint.Offset;
+    size_t src_row_bytes =
+        size_t(width) * component_count * sizeof(uint16_t);
+    for (UINT row = 0; row < num_rows; ++row) {
+      uint8_t* dst_row =
+          upload_data + row * footprint.Footprint.RowPitch;
+      const uint8_t* src_row =
+          reinterpret_cast<const uint8_t*>(staging.data()) +
+          size_t(row) * src_row_bytes;
+      std::memcpy(dst_row, src_row, src_row_bytes);
+      size_t padding = footprint.Footprint.RowPitch > src_row_bytes
+                           ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                           : 0u;
+      if (padding) {
+        std::memset(dst_row + src_row_bytes, 0, padding);
+      }
+    }
+    D3D12_RANGE written_range;
+    written_range.Begin = footprint.Offset;
+    written_range.End =
+        footprint.Offset +
+        num_rows * footprint.Footprint.RowPitch;
+    upload_buffer->Unmap(0, &written_range);
+
+    command_processor_.PushTransitionBarrier(
+        upload_buffer.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.SubmitBarriers();
+
+    D3D12_TEXTURE_COPY_LOCATION source_location;
+    source_location.pResource = upload_buffer.Get();
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source_location.PlacedFootprint = footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION dest_location;
+    dest_location.pResource = resource;
+    dest_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dest_location.SubresourceIndex = 0;
+
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &dest_location, 0, 0, 0, &source_location, nullptr);
+
+    command_processor_.RetainResourceForSubmission(upload_buffer.Get());
+
+    upload_success = true;
+  }
+
+  if (!upload_success) {
+    return false;
+  }
+
+  TransitionRenderTargetToState(
+      d3d12_rt,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+
+  surface->resource_state =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  if (surface->shared_state) {
+    *surface->shared_state = surface->resource_state;
+  }
+
+  surface->seeded = true;
+  return true;
+}
+
+
+void D3D12RenderTargetCache::RegisterHostSurfaceFromResolve(
+    const draw_util::ResolveInfo& resolve_info,
+    D3D12SharedMemory& shared_memory) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  if (resolve_info.IsCopyingDepth()) {
+    return;
+  }
+  xenos::ColorFormat dest_format =
+      xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format);
+  if (!IsMorphResolveFormat(dest_format)) {
+    return;
+  }
+  uint32_t width =
+      (resolve_info.coordinate_info.width_div_8
+       << xenos::kResolveAlignmentPixelsLog2) * draw_resolution_scale_x();
+  uint32_t height =
+      (resolve_info.height_div_8
+       << xenos::kResolveAlignmentPixelsLog2) * draw_resolution_scale_y();
+  HostSurfaceMetadataKey meta_key;
+  meta_key.base_page = resolve_info.copy_dest_base >> 12;
+  meta_key.texture_format =
+      xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format);
+  meta_key.width = width;
+  meta_key.height = height;
+  HostSurfaceMetadata metadata;
+  metadata.key = meta_key;
+  metadata.number_format = resolve_info.copy_dest_info.copy_dest_number;
+  metadata.copy_sample_select =
+      resolve_info.copy_dest_coordinate_info.copy_sample_select;
+  metadata.pitch_tiles_at_32bpp =
+      resolve_info.color_edram_info.pitch_tiles >>
+      uint32_t(resolve_info.color_edram_info.format_is_64bpp);
+  metadata.msaa_samples = resolve_info.color_edram_info.msaa_samples;
+  metadata.gamma_render_target =
+      resolve_info.color_edram_info.format ==
+      uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA);
+  metadata.render_target_key.base_tiles = resolve_info.color_original_base;
+  metadata.render_target_key.pitch_tiles_at_32bpp =
+      metadata.pitch_tiles_at_32bpp;
+  metadata.render_target_key.msaa_samples = metadata.msaa_samples;
+  metadata.render_target_key.is_depth = 0;
+  SetColorRenderTargetResourceFormat(
+      metadata.render_target_key,
+      xenos::ColorRenderTargetFormat(
+          resolve_info.color_edram_info.format));
+  metadata.render_target_key.host_repacked = 1;
+  host_surface_metadata_[meta_key] = metadata;
+  std::vector<HostSurface*> surfaces_to_remove;
+  surfaces_to_remove.reserve(host_surfaces_by_texture_.size());
+  for (const auto& texture_pair : host_surfaces_by_texture_) {
+    HostSurface* surface = texture_pair.second;
+    if (surface->texture_key.base_page == meta_key.base_page &&
+        surface->texture_key.texture_format == meta_key.texture_format &&
+        surface->texture_key.width == meta_key.width &&
+        surface->texture_key.height == meta_key.height) {
+      surfaces_to_remove.push_back(surface);
+    }
+  }
+  for (HostSurface* surface : surfaces_to_remove) {
+    RemoveHostSurface(surface);
+    host_surfaces_by_render_target_.erase(surface->render_target_key);
+  }
+
+  HostSurfaceTextureKey surface_key;
+  surface_key.base_page = meta_key.base_page;
+  surface_key.texture_format = meta_key.texture_format;
+  surface_key.width = meta_key.width;
+  surface_key.height = meta_key.height;
+  surface_key.signed_mask = GetMorphFormatSignedMask(
+      surface_key.texture_format, metadata.number_format);
+
+  CreateAndSeedHostSurfaceFromResolve(surface_key, metadata, resolve_info,
+                                      shared_memory);
+}
+
+bool D3D12RenderTargetCache::AcquireHostSurface(
+    const HostSurfaceTextureKey& surface_key, ID3D12Resource*& resource_out,
+    D3D12_RESOURCE_STATES*& shared_state_out) {
+  resource_out = nullptr;
+  shared_state_out = nullptr;
+  if (!IsMorphTextureFormat(surface_key.texture_format)) {
+    return false;
+  }
+  HostSurfaceMetadataKey meta_key;
+  meta_key.base_page = surface_key.base_page;
+  meta_key.texture_format = surface_key.texture_format;
+  meta_key.width = surface_key.width;
+  meta_key.height = surface_key.height;
+  auto metadata_it = host_surface_metadata_.find(meta_key);
+  if (metadata_it == host_surface_metadata_.end()) {
+    return false;
+  }
+  auto surface_it = host_surfaces_by_texture_.find(surface_key);
+  if (surface_it == host_surfaces_by_texture_.end()) {
+    return false;
+  }
+  HostSurface* surface = surface_it->second;
+  if (!surface->seeded) {
+    static uint32_t morph_host_surface_unseeded_logs = 0;
+    if (morph_host_surface_unseeded_logs < 16) {
+      ++morph_host_surface_unseeded_logs;
+      XELOGGPU(
+          "Morph host surface base_page=0x{:05X} format={} requested before "
+          "seeding",
+          surface_key.base_page, uint32_t(surface_key.texture_format));
+    }
+    return false;
+  }
+  if (!surface->render_target || !surface->resource.Get()) {
+    return false;
+  }
+  resource_out = surface->resource.Get();
+  shared_state_out =
+      surface->shared_state ? surface->shared_state : &surface->resource_state;
+  if (surface->render_target) {
+    D3D12_RESOURCE_STATES required_state =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (surface->resource_state != required_state) {
+      TransitionRenderTargetToState(*surface->render_target, required_state);
+      command_processor_.SubmitBarriers();
+    }
+  }
+  return true;
+}
+
+bool D3D12RenderTargetCache::EnsureHostSurfaceForTexture(
+    const HostSurfaceTextureKey& surface_key, ID3D12Resource*& resource_out,
+    D3D12_RESOURCE_STATES*& shared_state_out, bool& seeded_out,
+    DXGI_FORMAT* rtv_format_out) {
+  resource_out = nullptr;
+  shared_state_out = nullptr;
+  seeded_out = false;
+  if (!IsMorphTextureFormat(surface_key.texture_format)) {
+    return false;
+  }
+
+  EnsureHostSurfaceMetadataForTexture(surface_key);
+
+  HostSurfaceMetadataKey meta_key;
+  meta_key.base_page = surface_key.base_page;
+  meta_key.texture_format = surface_key.texture_format;
+  meta_key.width = surface_key.width;
+  meta_key.height = surface_key.height;
+  auto metadata_it = host_surface_metadata_.find(meta_key);
+  if (metadata_it == host_surface_metadata_.end()) {
+    return false;
+  }
+
+  HostSurface* surface = EnsureHostSurface(metadata_it->second.render_target_key,
+                                            surface_key.width,
+                                            surface_key.height);
+  if (!surface || !surface->render_target) {
+    static uint32_t morph_host_surface_ensure_failures = 0;
+    if (morph_host_surface_ensure_failures < 16) {
+      ++morph_host_surface_ensure_failures;
+      XELOGGPU(
+          "Failed to ensure morph host surface for base_page=0x{:05X} "
+          "format={} w={} h={} (surface {} render_target {})",
+          surface_key.base_page, uint32_t(surface_key.texture_format),
+          surface_key.width, surface_key.height, surface != nullptr,
+          surface && surface->render_target != nullptr);
+    }
+    return false;
+  }
+
+  if (surface->texture_registered && surface->texture_key != surface_key) {
+    host_surfaces_by_texture_.erase(surface->texture_key);
+    if (surface->texture_key.base_page) {
+      auto base_it =
+          host_surfaces_by_base_page_.find(surface->texture_key.base_page);
+      if (base_it != host_surfaces_by_base_page_.end() &&
+          base_it->second == surface) {
+        host_surfaces_by_base_page_.erase(base_it);
+      }
+    }
+    surface->texture_registered = false;
+  }
+
+  surface->texture_key = surface_key;
+  surface->texture_registered = true;
+  host_surfaces_by_texture_[surface_key] = surface;
+  if (surface_key.base_page) {
+    host_surfaces_by_base_page_[surface_key.base_page] = surface;
+  }
+  surface->render_target_key =
+      CanonicalizeHostSurfaceRenderTargetKey(
+          metadata_it->second.render_target_key);
+  surface->number_format = metadata_it->second.number_format;
+  surface->signed_mask = surface_key.signed_mask;
+  if (surface->render_target) {
+    surface->rtv_format = surface->render_target->rtv_format();
+  }
+
+  resource_out = surface->resource.Get();
+  shared_state_out =
+      surface->shared_state ? surface->shared_state : &surface->resource_state;
+  seeded_out = surface->seeded;
+  if (rtv_format_out) {
+    *rtv_format_out = surface->rtv_format;
+  }
+  if (surface->render_target && surface->seeded) {
+    D3D12_RESOURCE_STATES required_state =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (surface->resource_state != required_state) {
+      TransitionRenderTargetToState(*surface->render_target, required_state);
+      command_processor_.SubmitBarriers();
+    }
+  }
+  return resource_out != nullptr;
+}
+
+void D3D12RenderTargetCache::MarkHostSurfaceSeeded(
+    const HostSurfaceTextureKey& surface_key) {
+  auto texture_it = host_surfaces_by_texture_.find(surface_key);
+  if (texture_it != host_surfaces_by_texture_.end()) {
+    texture_it->second->seeded = true;
+    return;
+  }
+  if (surface_key.base_page) {
+    auto base_it = host_surfaces_by_base_page_.find(surface_key.base_page);
+    if (base_it != host_surfaces_by_base_page_.end() && base_it->second) {
+      base_it->second->seeded = true;
+    }
+  }
+}
+
+
+
+void D3D12RenderTargetCache::EnsureHostSurfaceMetadataForTexture(
+    const HostSurfaceTextureKey& surface_key) {
+  HostSurfaceMetadataKey meta_key;
+  meta_key.base_page = surface_key.base_page;
+  meta_key.texture_format = surface_key.texture_format;
+  meta_key.width = surface_key.width;
+  meta_key.height = surface_key.height;
+  if (host_surface_metadata_.find(meta_key) != host_surface_metadata_.end()) {
+    return;
+  }
+
+  HostSurfaceMetadata metadata;
+  metadata.key = meta_key;
+  metadata.number_format =
+      GetMorphSurfaceNumberFormatFromTexture(surface_key.texture_format);
+  metadata.copy_sample_select = xenos::CopySampleSelect::k0;
+  uint32_t pitch_tiles = (std::max<uint32_t>(1, ((surface_key.width + 31) >> 5)));
+  if (pitch_tiles > 0xFF) {
+    pitch_tiles = 0xFF;
+  }
+  uint32_t base_tiles = surface_key.base_page & ((UINT32_C(1) << xenos::kEdramBaseTilesBits) - 1);
+  metadata.pitch_tiles_at_32bpp = pitch_tiles;
+  metadata.msaa_samples = xenos::MsaaSamples::k1X;
+  metadata.gamma_render_target = false;
+  metadata.render_target_key.key = 0;
+  metadata.render_target_key.base_tiles = base_tiles;
+  metadata.render_target_key.pitch_tiles_at_32bpp = pitch_tiles;
+  metadata.render_target_key.msaa_samples = xenos::MsaaSamples::k1X;
+  metadata.render_target_key.is_depth = 0;
+  metadata.render_target_key.resource_format = static_cast<uint32_t>(
+      GetMorphRenderTargetFormatForTexture(surface_key.texture_format));
+  metadata.render_target_key.host_repacked = 1;
+  host_surface_metadata_[meta_key] = metadata;
+}
+
+bool D3D12RenderTargetCache::HasHostSurfaceForGuestBase(
+    uint32_t base_page_or_address) const {
+  if (!base_page_or_address) {
+    return false;
+  }
+  constexpr uint32_t kPageCount = SharedMemory::kBufferSize >> 12;
+  uint32_t base_page = base_page_or_address;
+  if (base_page >= kPageCount) {
+    base_page = base_page_or_address >> 12;
+  }
+  if (!base_page) {
+    return false;
+  }
+  auto it = host_surfaces_by_base_page_.find(base_page);
+  if (it == host_surfaces_by_base_page_.end()) {
+    return false;
+  }
+  HostSurface* surface = it->second;
+  return surface && surface->seeded;
+}
+
+
 
 void D3D12RenderTargetCache::CompletedSubmissionUpdated() {
   if (edram_snapshot_restore_pool_) {
@@ -1481,6 +2536,11 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          if (copied && !resolve_info.IsCopyingDepth() &&
+              IsMorphResolveFormat(
+                  xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+            RegisterHostSurfaceFromResolve(resolve_info, shared_memory);
+          }
         }
       } else {
         XELOGE(
@@ -1737,11 +2797,8 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
           }
         }
       }
-      command_processor_.PushTransitionBarrier(
-          full_edram_render_target->resource(),
-          full_edram_render_target->SetResourceState(
-              D3D12_RESOURCE_STATE_COPY_DEST),
-          D3D12_RESOURCE_STATE_COPY_DEST);
+      TransitionRenderTargetToState(*full_edram_render_target,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
       command_processor_.SubmitBarriers();
       D3D12_TEXTURE_COPY_LOCATION copy_dest_location;
       copy_dest_location.pResource = full_edram_render_target->resource();
@@ -1783,17 +2840,14 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    // SNORM has two representations of -1.
     case xenos::ColorRenderTargetFormat::k_16_16:
-      return DXGI_FORMAT_R16G16_TYPELESS;
+      return DXGI_FORMAT_R16G16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-      return DXGI_FORMAT_R16G16B16A16_TYPELESS;
-    // Floating-point - ensure NaN propagation during ownership transfer for
-    // unmodified data.
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
-      return DXGI_FORMAT_R16G16_TYPELESS;
+      return DXGI_FORMAT_R16G16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-      return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     // TODO(Triang3l): Check if NaN propagation defined in the D3D11.3
     // specification can be relied on for 32-bit float render targets.
     case xenos::ColorRenderTargetFormat::k_32_FLOAT:
@@ -1815,9 +2869,9 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorDrawDXGIFormat(
       return gamma_render_target_as_srgb_ ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
                                           : DXGI_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_16_16:
-      return DXGI_FORMAT_R16G16_SNORM;
+      return DXGI_FORMAT_R16G16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-      return DXGI_FORMAT_R16G16B16A16_SNORM;
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
       return DXGI_FORMAT_R16G16_FLOAT;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
@@ -1833,26 +2887,33 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorDrawDXGIFormat(
 
 DXGI_FORMAT D3D12RenderTargetCache::GetColorOwnershipTransferDXGIFormat(
     xenos::ColorRenderTargetFormat format, bool* is_integer_out) const {
-  if (is_integer_out) {
-    *is_integer_out = true;
-  }
+  bool is_integer = false;
+  DXGI_FORMAT dxgi_format;
   switch (format) {
     case xenos::ColorRenderTargetFormat::k_16_16:
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
-      return DXGI_FORMAT_R16G16_UINT;
+      dxgi_format = DXGI_FORMAT_R16G16_FLOAT;
+      break;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16:
     case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-      return DXGI_FORMAT_R16G16B16A16_UINT;
+      dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      break;
     case xenos::ColorRenderTargetFormat::k_32_FLOAT:
-      return DXGI_FORMAT_R32_UINT;
+      is_integer = true;
+      dxgi_format = DXGI_FORMAT_R32_UINT;
+      break;
     case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
-      return DXGI_FORMAT_R32G32_UINT;
+      is_integer = true;
+      dxgi_format = DXGI_FORMAT_R32G32_UINT;
+      break;
     default:
-      if (is_integer_out) {
-        *is_integer_out = false;
-      }
-      return GetColorDrawDXGIFormat(format);
+      dxgi_format = GetColorDrawDXGIFormat(format);
+      break;
   }
+  if (is_integer_out) {
+    *is_integer_out = is_integer;
+  }
+  return dxgi_format;
 }
 
 DXGI_FORMAT D3D12RenderTargetCache::GetDepthResourceDXGIFormat(
@@ -1910,6 +2971,27 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(
 RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(
     RenderTargetKey key) {
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+    if (!key.is_depth && IsMorphRenderTargetFormat(key.GetColorFormat())) {
+    uint32_t width_samples = key.GetWidth();
+    uint32_t height_samples = GetRenderTargetHeight(
+        key.pitch_tiles_at_32bpp, key.msaa_samples);
+    if (!width_samples) {
+      width_samples = 1;
+    }
+    if (!height_samples) {
+      height_samples = 1;
+    }
+    uint32_t width_pixels = width_samples * draw_resolution_scale_x();
+    uint32_t height_pixels =
+        height_samples * draw_resolution_scale_y();
+    HostSurface* surface =
+        EnsureHostSurface(key, width_pixels, height_pixels);
+    if (surface) {
+      return surface->render_target;
+    }
+    return nullptr;
+  }
 
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2082,10 +3164,10 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(
                                    descriptor_srv.GetHandle());
 
   return new D3D12RenderTarget(
-      key, resource.Get(), std::move(descriptor_draw),
-      std::move(descriptor_draw_srgb), std::move(descriptor_load_separate),
-      std::move(descriptor_srv), std::move(descriptor_srv_stencil),
-      resource_state);
+      key, resource.Get(), optimized_clear_value.Format,
+      std::move(descriptor_draw), std::move(descriptor_draw_srgb),
+      std::move(descriptor_load_separate), std::move(descriptor_srv),
+      std::move(descriptor_srv_stencil), resource_state);
 }
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(
@@ -4551,10 +5633,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         // anyway even in the best case, so it's not possible to have all the
         // barriers in one place here.
         TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        command_processor_.PushTransitionBarrier(
-            dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        TransitionRenderTargetToState(
+            dest_d3d12_rt,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // Pipeline.
         command_processor_.SetExternalPipeline(
@@ -4624,11 +5704,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (!source_previously_used_as_dest) {
         auto& source_d3d12_rt =
             *static_cast<D3D12RenderTarget*>(transfer.source);
-        command_processor_.PushTransitionBarrier(
-            source_d3d12_rt.resource(),
-            source_d3d12_rt.SetResourceState(
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        TransitionRenderTargetToState(
+            source_d3d12_rt,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       }
       // transfer.host_depth_source == dest_rt means the EDRAM buffer will be
       // used instead, no need to transition.
@@ -4636,11 +5715,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           !host_depth_source_previously_used_as_dest) {
         auto& host_depth_source_d3d12_rt =
             *static_cast<D3D12RenderTarget*>(transfer.host_depth_source);
-        command_processor_.PushTransitionBarrier(
-            host_depth_source_d3d12_rt.resource(),
-            host_depth_source_d3d12_rt.SetResourceState(
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        TransitionRenderTargetToState(
+            host_depth_source_d3d12_rt,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       }
     }
     // Transition the destination, only if not going to be used as a source
@@ -4659,9 +5737,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       D3D12_RESOURCE_STATES dest_state =
           dest_d3d12_rt.key().is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                        : D3D12_RESOURCE_STATE_RENDER_TARGET;
-      command_processor_.PushTransitionBarrier(
-          dest_d3d12_rt.resource(), dest_d3d12_rt.SetResourceState(dest_state),
-          dest_state);
+      TransitionRenderTargetToState(dest_d3d12_rt, dest_state);
     }
   }
   if (host_depth_store_set_up) {
@@ -4791,9 +5867,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     D3D12_RESOURCE_STATES dest_state = dest_rt_key.is_depth
                                            ? D3D12_RESOURCE_STATE_DEPTH_WRITE
                                            : D3D12_RESOURCE_STATE_RENDER_TARGET;
-    command_processor_.PushTransitionBarrier(
-        dest_d3d12_rt.resource(), dest_d3d12_rt.SetResourceState(dest_state),
-        dest_state);
+    TransitionRenderTargetToState(dest_d3d12_rt, dest_state);
+    command_processor_.SubmitBarriers();
 
     if (!current_transfers.empty()) {
       are_current_command_list_render_targets_valid_ = false;
@@ -4807,6 +5882,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         auto handle = dest_d3d12_rt.descriptor_load_separate().IsValid()
                           ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
                           : dest_d3d12_rt.descriptor_draw().GetHandle();
+        D3D12_RESOURCE_DESC render_target_desc =
+            dest_d3d12_rt.resource()->GetDesc();
+        assert_true((render_target_desc.Flags &
+                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
         command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
       }
 
@@ -5020,24 +6099,24 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
         // Late barriers in case there was cross-copying that prevented merging
         // of barriers.
-        command_processor_.PushTransitionBarrier(
-            source_d3d12_rt.resource(),
-            source_d3d12_rt.SetResourceState(
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        TransitionRenderTargetToState(
+            source_d3d12_rt,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (host_depth_source_d3d12_rt) {
           if (transfer_shader_key.host_depth_source_is_copy) {
             // Reading copied host depth from the EDRAM buffer.
             TransitionEdramBuffer(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
           } else {
             // Reading host depth from the texture.
-            command_processor_.PushTransitionBarrier(
-                host_depth_source_d3d12_rt->resource(),
-                host_depth_source_d3d12_rt->SetResourceState(
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            TransitionRenderTargetToState(
+                *host_depth_source_d3d12_rt,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
           }
         }
+
+        command_processor_.SubmitBarriers();
 
         uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
         D3D12_VERTEX_BUFFER_VIEW transfer_rectangle_buffer_view;
@@ -5341,10 +6420,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
             break;
         }
-        command_processor_.PushTransitionBarrier(
-            dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
-            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        TransitionRenderTargetToState(dest_d3d12_rt,
+                                      D3D12_RESOURCE_STATE_DEPTH_WRITE);
         command_processor_.SubmitBarriers();
         command_list.D3DClearDepthStencilView(
             dest_d3d12_rt.descriptor_draw().GetHandle(),
@@ -5417,16 +6494,19 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             }
           } break;
         }
-        command_processor_.PushTransitionBarrier(
-            dest_d3d12_rt.resource(),
-            dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
-            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        TransitionRenderTargetToState(dest_d3d12_rt,
+                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
         if (clear_via_drawing) {
           auto handle =
               (dest_d3d12_rt.descriptor_load_separate().IsValid()
                    ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
                    : dest_d3d12_rt.descriptor_draw().GetHandle());
+          D3D12_RESOURCE_DESC render_target_desc =
+              dest_d3d12_rt.resource()->GetDesc();
+          assert_true((render_target_desc.Flags &
+                       D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
 
+          command_processor_.SubmitBarriers();
           command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
           are_current_command_list_render_targets_valid_ = true;
           D3D12_VIEWPORT clear_viewport;
@@ -5473,10 +6553,8 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
   if (depth_and_color_render_targets[0]) {
     auto& d3d12_rt =
         *static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0]);
-    command_processor_.PushTransitionBarrier(
-        d3d12_rt.resource(),
-        d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
-        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    TransitionRenderTargetToState(d3d12_rt,
+                                  D3D12_RESOURCE_STATE_DEPTH_WRITE);
   }
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     RenderTarget* render_target = depth_and_color_render_targets[1 + i];
@@ -5484,11 +6562,11 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
       continue;
     }
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(render_target);
-    command_processor_.PushTransitionBarrier(
-        d3d12_rt.resource(),
-        d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET),
-        D3D12_RESOURCE_STATE_RENDER_TARGET);
+    TransitionRenderTargetToState(d3d12_rt,
+                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
   }
+
+  command_processor_.SubmitBarriers();
 
   // Bind the render targets.
   if (are_current_command_list_render_targets_valid_) {
@@ -5542,11 +6620,15 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
                 : null_rtv_descriptor_ss_.GetHandle();
       }
       auto& d3d12_rt = *static_cast<const D3D12RenderTarget*>(render_target);
+      D3D12_RESOURCE_DESC render_target_desc = d3d12_rt.resource()->GetDesc();
+      assert_true((render_target_desc.Flags &
+                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
       rtv_handles[rtv_count++] =
           (render_targets_are_srgb & (uint32_t(1) << i))
               ? d3d12_rt.descriptor_draw_srgb().GetHandle()
               : d3d12_rt.descriptor_draw().GetHandle();
     }
+    command_processor_.SubmitBarriers();
     command_processor_.GetDeferredCommandList().D3DOMSetRenderTargets(
         rtv_count, rtv_handles, false,
         depth_and_color_render_targets[0] ? &dsv_handle : nullptr);
@@ -6422,11 +7504,8 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
-    command_processor_.PushTransitionBarrier(
-        d3d12_rt.resource(),
-        d3d12_rt.SetResourceState(
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    TransitionRenderTargetToState(
+        d3d12_rt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (d3d12_rt.temporary_sort_index() == UINT32_MAX) {
       d3d12_rt.SetTemporarySortIndex(rt_sort_index++);
     }
@@ -6640,3 +7719,14 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
 }  // namespace d3d12
 }  // namespace gpu
 }  // namespace xe
+
+
+
+
+
+
+
+
+
+
+

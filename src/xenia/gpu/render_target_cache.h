@@ -39,9 +39,13 @@ DECLARE_bool(snorm16_render_target_full_range);
 
 namespace xe {
 namespace gpu {
+namespace d3d12 {
+class D3D12RenderTargetCache;
+}
 
 class RenderTargetCache {
  public:
+  friend class d3d12::D3D12RenderTargetCache;
   // High-level emulation logic implementation path.
   enum class Path {
     // Approximate method using conventional host render targets and copying
@@ -276,6 +280,7 @@ class RenderTargetCache {
       uint32_t is_depth : 1;                                      // 22
       // Ignoring the blending precision and sRGB.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      uint32_t host_repacked : 1;                                 // 27
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -706,8 +711,28 @@ class RenderTargetCache {
     }
     return xenos::GetStorageColorFormat(format);
   }
+  static constexpr bool IsHostRepackedColorFormat(
+      xenos::ColorRenderTargetFormat format) {
+    xenos::ColorRenderTargetFormat storage_format =
+        GetColorResourceFormat(format);
+    switch (storage_format) {
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+        return true;
+      default:
+        return false;
+    }
+  }
+  static constexpr void SetColorRenderTargetResourceFormat(
+      RenderTargetKey& key, xenos::ColorRenderTargetFormat format) {
+    xenos::ColorRenderTargetFormat storage_format =
+        GetColorResourceFormat(format);
+    key.resource_format = uint32_t(storage_format);
+    key.host_repacked = IsHostRepackedColorFormat(storage_format);
+  }
 
   RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+  void SetRenderTargetForKey(RenderTargetKey key, RenderTarget* render_target);
 
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the
