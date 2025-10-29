@@ -1550,6 +1550,18 @@ void D3D12RenderTargetCache::TransitionRenderTargetToState(
   if (host_surface_it != host_surfaces_by_render_target_.end()) {
     HostSurface* host_surface = host_surface_it->second.get();
     if (host_surface) {
+      if ((new_state &
+           (D3D12_RESOURCE_STATE_RENDER_TARGET |
+            D3D12_RESOURCE_STATE_COPY_DEST)) != 0) {
+        if (host_surface->texture_registered && host_surface->seeded) {
+          command_processor_.texture_cache().InvalidateHostSurfaceBindings(
+              host_surface->texture_key.base_page,
+              host_surface->texture_key.texture_format,
+              host_surface->texture_key.width,
+              host_surface->texture_key.height,
+              host_surface->texture_key.signed_mask);
+        }
+      }
       if (host_surface->shared_state) {
         *host_surface->shared_state = new_state;
       }
