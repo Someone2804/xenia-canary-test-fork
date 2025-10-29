@@ -1083,10 +1083,29 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      // TODO(Triang3l): Resolution-scaled buffer committing.
-      copy_dest_committed =
-          shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                     resolve_info.copy_dest_extent_length);
+      if (draw_resolution_scaled) {
+        // Mirroring the Direct3D 12 path, first make sure the portion of the
+        // scaled resolve buffer that will actually be written by the compute
+        // shader is backed by host memory, and then bind the buffer containing
+        // the base of the texture the resolve writes to so the shader can
+        // address it relative to that base.
+        copy_dest_committed =
+            texture_cache.EnsureScaledResolveMemoryCommittedPublic(
+                resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length,
+                copy_shader_info.dest_bpe_log2) &&
+            texture_cache.MakeScaledResolveRangeCurrent(
+                resolve_info.copy_dest_base,
+                resolve_info.copy_dest_extent_start -
+                    resolve_info.copy_dest_base +
+                    resolve_info.copy_dest_extent_length,
+                copy_shader_info.dest_bpe_log2);
+      } else {
+        // TODO(Triang3l): Resolution-scaled buffer committing.
+        copy_dest_committed =
+            shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                       resolve_info.copy_dest_extent_length);
+      }
       if (!copy_dest_committed) {
         XELOGE(
             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
@@ -1096,63 +1115,27 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
         // maxStorageBufferRange.
         // TODO(Triang3l): Use a single 512 MB shared memory binding if
         // possible.
-        VkDescriptorSet descriptor_set_dest =
-            command_processor_.AllocateSingleTransientDescriptor(
-                VulkanCommandProcessor::SingleTransientDescriptorLayout ::
-                    kStorageBufferCompute);
-        if (descriptor_set_dest != VK_NULL_HANDLE) {
-          // Write the destination descriptor.
-          VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
-
-          bool scaled_buffer_ready = false;
-          if (draw_resolution_scaled) {
-            // For scaled resolve, ensure the scaled buffer exists and bind to
-            // it
-            uint32_t dest_address = resolve_info.copy_dest_base;
-            uint32_t dest_length = resolve_info.copy_dest_extent_start -
-                                   resolve_info.copy_dest_base +
-                                   resolve_info.copy_dest_extent_length;
-
-            // Ensure scaled resolve memory is committed
-            scaled_buffer_ready = true;
-            if (!texture_cache.EnsureScaledResolveMemoryCommittedPublic(
-                    dest_address, dest_length,
-                    copy_shader_info.dest_bpe_log2)) {
+        VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info = {};
+        bool scaled_buffer_ready = false;
+        if (draw_resolution_scaled) {
+          scaled_buffer_ready = true;
+          VkBuffer scaled_buffer = texture_cache.GetCurrentScaledResolveBuffer();
+          if (scaled_buffer == VK_NULL_HANDLE) {
+            XELOGE(
+                "No current scaled resolve buffer for resolve dest at 0x{:08X}",
+                resolve_info.copy_dest_base);
+            scaled_buffer_ready = false;
+          } else {
+            const VulkanTextureCache::ScaledResolveBuffer* buffer_info =
+                texture_cache.GetScaledResolveBufferInfo(
+                    texture_cache.GetScaledResolveCurrentBufferIndex());
+            if (!buffer_info) {
               XELOGE(
-                  "Failed to commit scaled resolve memory for resolve dest at "
+                  "Missing scaled resolve buffer info for resolve dest at "
                   "0x{:08X}",
-                  dest_address);
+                  resolve_info.copy_dest_base);
               scaled_buffer_ready = false;
-            }
-
-            // Make the range current to get the buffer
-            if (scaled_buffer_ready &&
-                !texture_cache.MakeScaledResolveRangeCurrent(dest_address,
-                                                             dest_length,
-                                                             copy_shader_info
-                                                                 .dest_bpe_log2)) {
-              XELOGE(
-                  "Failed to make scaled resolve range current for resolve "
-                  "dest at 0x{:08X}",
-                  dest_address);
-              scaled_buffer_ready = false;
-            }
-
-            // Get the current scaled buffer
-            VkBuffer scaled_buffer = VK_NULL_HANDLE;
-            if (scaled_buffer_ready) {
-              scaled_buffer = texture_cache.GetCurrentScaledResolveBuffer();
-              if (scaled_buffer == VK_NULL_HANDLE) {
-                XELOGE(
-                    "No current scaled resolve buffer for resolve dest at "
-                    "0x{:08X}",
-                    dest_address);
-                scaled_buffer_ready = false;
-              }
-            }
-
-            if (scaled_buffer_ready) {
-              // Calculate offset within the scaled buffer
+            } else {
               const uint64_t range_start_scaled =
                   texture_cache.GetScaledResolveCurrentRangeStartScaled();
               const uint64_t range_length_scaled =
@@ -1161,76 +1144,68 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 XELOGE(
                     "Scaled resolve range length is zero for resolve dest at "
                     "0x{:08X}",
-                    dest_address);
+                    resolve_info.copy_dest_base);
                 scaled_buffer_ready = false;
               } else {
-                // Get the buffer's base offset to calculate relative offset
-                uint64_t buffer_relative_offset = 0;
-                VkDeviceSize buffer_relative_size = range_length_scaled;
-                size_t buffer_index =
-                    texture_cache.GetScaledResolveCurrentBufferIndex();
-                auto* buffer_info =
-                    texture_cache.GetScaledResolveBufferInfo(buffer_index);
-                if (!buffer_info) {
+                uint64_t buffer_relative_offset =
+                    range_start_scaled - buffer_info->range_start_scaled;
+                if (buffer_relative_offset >=
+                    buffer_info->range_length_scaled) {
                   XELOGE(
-                      "Missing scaled resolve buffer info for resolve dest at "
-                      "0x{:08X}",
-                      dest_address);
+                      "Scaled resolve offset 0x{:X} outside buffer range for "
+                      "resolve dest at 0x{:08X}",
+                      buffer_relative_offset, resolve_info.copy_dest_base);
                   scaled_buffer_ready = false;
                 } else {
-                  buffer_relative_offset =
-                      range_start_scaled - buffer_info->range_start_scaled;
-                  if (buffer_relative_offset >= buffer_info->range_length_scaled) {
+                  uint64_t buffer_available =
+                      buffer_info->range_length_scaled - buffer_relative_offset;
+                  VkDeviceSize buffer_relative_size =
+                      VkDeviceSize(std::min<uint64_t>(range_length_scaled,
+                                                      buffer_available));
+                  if (!buffer_relative_size) {
                     XELOGE(
-                        "Scaled resolve offset 0x{:X} outside buffer range for "
-                        "resolve dest at 0x{:08X}",
-                        buffer_relative_offset, dest_address);
+                        "Scaled resolve buffer size is zero for resolve dest "
+                        "at 0x{:08X}",
+                        resolve_info.copy_dest_base);
                     scaled_buffer_ready = false;
                   } else {
-                    uint64_t buffer_available =
-                        buffer_info->range_length_scaled -
+                    write_descriptor_set_dest_buffer_info.buffer = scaled_buffer;
+                    write_descriptor_set_dest_buffer_info.offset =
                         buffer_relative_offset;
-                    if (buffer_relative_size > buffer_available) {
-                      buffer_relative_size = buffer_available;
-                    }
-                  }
-                }
-
-                if (scaled_buffer_ready) {
-                  write_descriptor_set_dest_buffer_info.buffer = scaled_buffer;
-                  write_descriptor_set_dest_buffer_info.offset =
-                      buffer_relative_offset;
-                  write_descriptor_set_dest_buffer_info.range =
-                      buffer_relative_size;
-                  if (!write_descriptor_set_dest_buffer_info.range) {
-                    XELOGE(
-                        "Scaled resolve buffer size is zero for resolve dest at "
-                        "0x{:08X}",
-                        dest_address);
-                    scaled_buffer_ready = false;
+                    write_descriptor_set_dest_buffer_info.range =
+                        buffer_relative_size;
                   }
                 }
               }
             }
           }
+        }
 
-          if (!scaled_buffer_ready) {
-            // Regular unscaled resolve - write to shared memory
-            if (draw_resolution_scaled) {
-              XELOGW(
-                  "Falling back to unscaled resolve at 0x{:08X} - scaled "
-                  "buffer not available",
-                  resolve_info.copy_dest_base);
-            }
-            write_descriptor_set_dest_buffer_info.buffer =
-                shared_memory.buffer();
-            write_descriptor_set_dest_buffer_info.offset =
-                resolve_info.copy_dest_base;
-            write_descriptor_set_dest_buffer_info.range =
-                resolve_info.copy_dest_extent_start -
-                resolve_info.copy_dest_base +
-                resolve_info.copy_dest_extent_length;
-          }
+        if (draw_resolution_scaled && !scaled_buffer_ready) {
+          XELOGE(
+              "VulkanRenderTargetCache: Skipping scaled resolve for destination "
+              "at 0x{:08X} - scaled buffer unavailable",
+              resolve_info.copy_dest_base);
+          return false;
+        }
+
+        if (!scaled_buffer_ready) {
+          write_descriptor_set_dest_buffer_info.buffer = shared_memory.buffer();
+          write_descriptor_set_dest_buffer_info.offset =
+              resolve_info.copy_dest_base;
+          write_descriptor_set_dest_buffer_info.range =
+              resolve_info.copy_dest_extent_start -
+              resolve_info.copy_dest_base +
+              resolve_info.copy_dest_extent_length;
+        }
+
+        VkDescriptorSet descriptor_set_dest =
+            command_processor_.AllocateSingleTransientDescriptor(
+                VulkanCommandProcessor::SingleTransientDescriptorLayout ::
+                    kStorageBufferCompute);
+        if (descriptor_set_dest != VK_NULL_HANDLE) {
+          VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info_copy =
+              write_descriptor_set_dest_buffer_info;
           VkWriteDescriptorSet write_descriptor_set_dest;
           write_descriptor_set_dest.sType =
               VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1243,7 +1218,7 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
           write_descriptor_set_dest.pImageInfo = nullptr;
           write_descriptor_set_dest.pBufferInfo =
-              &write_descriptor_set_dest_buffer_info;
+              &write_descriptor_set_dest_buffer_info_copy;
           write_descriptor_set_dest.pTexelBufferView = nullptr;
           dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0,
                                      nullptr);
