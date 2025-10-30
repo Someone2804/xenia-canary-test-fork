@@ -17,6 +17,9 @@
 #include "xenia/ui/d3d12/d3d12_immediate_drawer.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+#include <windows.h>
+#include <d3d12sdklayers.h>
+#include <dxgidebug.h>
 DEFINE_bool(d3d12_debug, false, "Enable Direct3D 12 and DXGI debug layer.",
             "D3D12");
 DEFINE_bool(d3d12_break_on_error, false,
@@ -139,6 +142,48 @@ bool D3D12Provider::Initialize() {
   libraries_loaded &=
       (pfn_dxgi_get_debug_interface1_ = PFNDXGIGetDebugInterface1(
            GetProcAddress(library_dxgi_, "DXGIGetDebugInterface1"))) != nullptr;
+  #define XE_ENABLE_D3D12_DEBUG 1
+  #if XE_ENABLE_D3D12_DEBUG
+  {
+    // D3D12GetDebugInterface через GetProcAddress — без линковки d3d12.lib
+    Microsoft::WRL::ComPtr<ID3D12Debug> dbg;
+    if (HMODULE d3d12mod = LoadLibraryA("d3d12.dll")) {
+      using PFN_D3D12_GET_DEBUG_INTERFACE = HRESULT (WINAPI*)(REFIID, void**);
+      auto pfn = reinterpret_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(
+          GetProcAddress(d3d12mod, "D3D12GetDebugInterface"));
+      if (pfn) {
+        (void)pfn(IID_PPV_ARGS(&dbg));
+      }
+    }
+    if (dbg) {
+      dbg->EnableDebugLayer();
+      Microsoft::WRL::ComPtr<ID3D12Debug1> dbg1;
+      if (SUCCEEDED(dbg.As(&dbg1))) {
+        dbg1->SetEnableGPUBasedValidation(TRUE);
+      }
+      // Флаги GBV опциональны, задаём 0 чтобы не упираться в SDK-константы
+      Microsoft::WRL::ComPtr<ID3D12Debug3> dbg3;
+      if (SUCCEEDED(dbg.As(&dbg3))) {
+        dbg3->SetGPUBasedValidationFlags(
+            static_cast<D3D12_GPU_BASED_VALIDATION_FLAGS>(0));
+      }
+    }
+
+    // DXGIGetDebugInterface1 тоже через GetProcAddress — без линковки dxgi.lib
+    if (HMODULE dxgimod = LoadLibraryA("DXGIDebug.dll")) {
+      using PFN_DXGI_GET_DEBUG_INTERFACE1 = HRESULT (WINAPI*)(UINT, REFIID, void**);
+      auto pfn_dxgi = reinterpret_cast<PFN_DXGI_GET_DEBUG_INTERFACE1>(
+          GetProcAddress(dxgimod, "DXGIGetDebugInterface1"));
+      Microsoft::WRL::ComPtr<IDXGIInfoQueue> info;
+      if (pfn_dxgi && SUCCEEDED(pfn_dxgi(0, IID_PPV_ARGS(&info)))) {
+        info->SetBreakOnSeverity(DXGI_DEBUG_ALL,
+                                 DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR, TRUE);
+        info->SetBreakOnSeverity(DXGI_DEBUG_ALL,
+                                 DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+      }
+    }
+  }
+  #endif
   libraries_loaded &=
       (pfn_d3d12_get_debug_interface_ = PFN_D3D12_GET_DEBUG_INTERFACE(
            GetProcAddress(library_d3d12_, "D3D12GetDebugInterface"))) !=

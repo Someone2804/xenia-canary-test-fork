@@ -63,6 +63,10 @@ uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
   }
 }
 
+static inline bool IsK8888A(xenos::TextureFormat fmt) {
+  return fmt == xenos::TextureFormat::k_8_8_8_8_A;
+}
+
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -1345,37 +1349,37 @@ void D3D12TextureCache::AdjustHostRepackForKey(TextureKey& key) {
 
 std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     TextureKey key) {
-  if (D3D12RenderTargetCache::IsMorphTextureFormat(key.format) && key.host_repacked) {
-    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
-    surface_key.base_page      = key.base_page;
-    surface_key.texture_format = key.format;
-    surface_key.width          = key.GetWidth();
-    surface_key.height         = key.GetHeight();
-    surface_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
-
-    ID3D12Resource* host_resource = nullptr;
-    D3D12_RESOURCE_STATES* shared_state = nullptr;
-    bool surface_seeded = false;
-    if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
-            surface_key, host_resource, shared_state, surface_seeded)) {
-      if (host_resource && shared_state) {
-        auto tex = std::unique_ptr<Texture>(new D3D12Texture(
-            *this, key, host_resource, *shared_state, shared_state));
-
-        // Seed morph HostSurface on first use so hero/dog are not black at spawn.
-        const bool is_k8888a = (key.format == xenos::TextureFormat::k_8_8_8_8_A);
-        const bool is_plain16 = (GetComponentCountForPlain16Bit(key.format) != 0);
-        if (!surface_seeded) {
-          if (is_k8888a) {
-            UploadK8888ATexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
-          } else if (is_plain16) {
-            UploadPlain16BitTexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
-          }
-        }
-        return tex;
-      }
-    }
-  }
+//  if (D3D12RenderTargetCache::IsMorphTextureFormat(key.format) && key.host_repacked) {
+//    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+//    surface_key.base_page      = key.base_page;
+//    surface_key.texture_format = key.format;
+//    surface_key.width          = key.GetWidth();
+//    surface_key.height         = key.GetHeight();
+//    surface_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
+//
+//    ID3D12Resource* host_resource = nullptr;
+//    D3D12_RESOURCE_STATES* shared_state = nullptr;
+//    bool surface_seeded = false;
+//    if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+//            surface_key, host_resource, shared_state, surface_seeded)) {
+//      if (host_resource && shared_state) {
+//        auto tex = std::unique_ptr<Texture>(new D3D12Texture(
+//            *this, key, host_resource, *shared_state, shared_state));
+//
+//        // Seed morph HostSurface on first use so hero/dog are not black at spawn.
+//        const bool is_k8888a = (key.format == xenos::TextureFormat::k_8_8_8_8_A);
+//        const bool is_plain16 = (GetComponentCountForPlain16Bit(key.format) != 0);
+//        if (!surface_seeded) {
+//          if (is_k8888a) {
+//            UploadK8888ATexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
+//          } else if (is_plain16) {
+//            UploadPlain16BitTexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
+//          }
+//        }
+//        return tex;
+//      }
+//    }
+//  }
 
   // Fallback legacy path for non-morph formats.
   D3D12_RESOURCE_DESC desc;

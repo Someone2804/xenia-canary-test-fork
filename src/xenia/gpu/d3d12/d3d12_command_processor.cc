@@ -9,6 +9,9 @@
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include <cstring>
+#include <d3d12sdklayers.h>
+#include <string>
+#include <windows.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
@@ -36,6 +39,80 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "D3D12");
 
 DECLARE_bool(clear_memory_page_state);
+
+static std::string NarrowUtf8(const wchar_t* ws) {
+  if (!ws) return "<null>";
+  int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+  if (n <= 1) return std::string();
+  std::string out;
+  out.resize(size_t(n - 1));
+  WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), n, nullptr, nullptr);
+  return out;
+}
+
+static void xe_d3d12_dump_dred(ID3D12Device* device) {
+  using Microsoft::WRL::ComPtr;
+
+  // Try DRED v1
+  if (ComPtr<ID3D12DeviceRemovedExtendedData1> dred1;
+      SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred1)))) {
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 ab = {};
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 pf = {};
+    dred1->GetAutoBreadcrumbsOutput1(&ab);
+    dred1->GetPageFaultAllocationOutput1(&pf);
+
+    if (ab.pHeadAutoBreadcrumbNode) {
+      const D3D12_AUTO_BREADCRUMB_NODE1* n = ab.pHeadAutoBreadcrumbNode;
+      XELOGE("DRED: AutoBreadcrumbs1 CL={} CQ={} BC={}",
+             NarrowUtf8(n->pCommandListDebugNameW),
+             NarrowUtf8(n->pCommandQueueDebugNameW),
+             static_cast<unsigned>(n->BreadcrumbCount));
+    }
+    if (pf.PageFaultVA) {
+      XELOGE("DRED: PageFault1 VA=0x{:016X}",
+             static_cast<unsigned long long>(pf.PageFaultVA));
+      if (pf.pHeadExistingAllocationNode) {
+        XELOGE("DRED: Existing={}",
+               NarrowUtf8(pf.pHeadExistingAllocationNode->ObjectNameW));
+      }
+      if (pf.pHeadRecentFreedAllocationNode) {
+        XELOGE("DRED: Freed={}",
+               NarrowUtf8(pf.pHeadRecentFreedAllocationNode->ObjectNameW));
+      }
+    }
+    return;
+  }
+
+  // Fallback: DRED v0
+  if (Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred0;
+      SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred0)))) {
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT ab0 = {};
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf0 = {};
+    dred0->GetAutoBreadcrumbsOutput(&ab0);
+    dred0->GetPageFaultAllocationOutput(&pf0);
+
+    if (ab0.pHeadAutoBreadcrumbNode) {
+      const D3D12_AUTO_BREADCRUMB_NODE* n = ab0.pHeadAutoBreadcrumbNode;
+      XELOGE("DRED: AutoBreadcrumbs0 CL={} CQ={} BC={}",
+             NarrowUtf8(n->pCommandListDebugNameW),
+             NarrowUtf8(n->pCommandQueueDebugNameW),
+             static_cast<unsigned>(n->BreadcrumbCount));
+    }
+    if (pf0.PageFaultVA) {
+      XELOGE("DRED: PageFault0 VA=0x{:016X}",
+             static_cast<unsigned long long>(pf0.PageFaultVA));
+      if (pf0.pHeadExistingAllocationNode) {
+        XELOGE("DRED: Existing={}",
+               NarrowUtf8(pf0.pHeadExistingAllocationNode->ObjectNameW));
+      }
+      if (pf0.pHeadRecentFreedAllocationNode) {
+        XELOGE("DRED: Freed={}",
+               NarrowUtf8(pf0.pHeadRecentFreedAllocationNode->ObjectNameW));
+      }
+    }
+  }
+}
+
 
 namespace xe {
 namespace gpu {
@@ -3240,6 +3317,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
+    XELOGE("D3D12 GetDeviceRemovedReason = 0x{:08X}", static_cast<unsigned>(device_removed_reason));
+    xe_d3d12_dump_dred(device);
     device_removed_ = true;
     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                  DXGI_ERROR_DEVICE_REMOVED);
