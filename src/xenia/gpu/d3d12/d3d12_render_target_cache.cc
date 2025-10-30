@@ -1386,14 +1386,14 @@ D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
       srv_default_format = DXGI_FORMAT_R8G8B8A8_UNORM;
       break;
     case xenos::ColorRenderTargetFormat::k_16_16:
-      resource_format = DXGI_FORMAT_R16G16_FLOAT;
-      rtv_format = resource_format;
-      srv_default_format = resource_format;
+      resource_format = DXGI_FORMAT_R16G16_TYPELESS;
+      rtv_format = DXGI_FORMAT_R16G16_FLOAT;
+      srv_default_format = DXGI_FORMAT_R16G16_UNORM;
       break;
     case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-      resource_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-      rtv_format = resource_format;
-      srv_default_format = resource_format;
+      resource_format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+      rtv_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      srv_default_format = DXGI_FORMAT_R16G16B16A16_UNORM;
       break;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
       resource_format = DXGI_FORMAT_R16G16_FLOAT;

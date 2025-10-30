@@ -14,6 +14,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 
 #include <DirectXPackedVector.h>
@@ -58,6 +59,9 @@ constexpr bool kDogAlphaUseHighByte = true;
 // SANITY #2 (RGB): swap R and B channels to validate the color ordering of the
 // morph RGB plane.
 #define XENIA_MORPH_SWAP_RB 0
+// Optional instrumentation for Fable II morph debugging.
+#define XE_FABLE2_TRACE_MORPH 0
+#define XE_FABLE2_SOLID_COLOR 0
 
 constexpr bool IsK8888A(xenos::TextureFormat format) {
   return format == xenos::TextureFormat::k_8_8_8_8_A;
@@ -81,16 +85,6 @@ constexpr uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
     default:
       return 0;
   }
-}
-
-constexpr DXGI_FORMAT GetMorphResourceFormat(xenos::TextureFormat format) {
-  if (IsK8888A(format)) {
-    return DXGI_FORMAT_R8G8B8A8_UNORM;
-  }
-  if (IsPlain16Bit(format)) {
-    return DXGI_FORMAT_R16G16B16A16_FLOAT;
-  }
-  return DXGI_FORMAT_UNKNOWN;
 }
 
 namespace {
@@ -1487,13 +1481,55 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
   }
 #endif  // K8888A_FORCE_GREY
 
+  if (IsMorphFormat(key)) {
+    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+    surface_key.base_page = key.base_page;
+    surface_key.texture_format = key.format;
+    surface_key.width = key.GetWidth();
+    surface_key.height = key.GetHeight();
+    surface_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
+
+    ID3D12Resource* resource = nullptr;
+    D3D12_RESOURCE_STATES* shared_state = nullptr;
+    bool seeded = false;
+    DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
+    if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+            surface_key, resource, shared_state, seeded, &rtv_format) ||
+        resource == nullptr || shared_state == nullptr) {
+      return nullptr;
+    }
+
+#if XE_FABLE2_TRACE_MORPH
+    {
+      const D3D12_RESOURCE_DESC surface_desc = resource->GetDesc();
+      uint64_t log_hash = (uint64_t(surface_key.base_page) << 32) ^
+                          (uint64_t(surface_key.width) << 16) ^
+                          uint64_t(surface_key.height) ^
+                          (uint64_t(surface_key.texture_format) << 48) ^
+                          (uint64_t(surface_key.signed_mask) << 8);
+      static std::unordered_set<uint64_t> logged_morph_surfaces;
+      if (logged_morph_surfaces.insert(log_hash).second) {
+        XELOGI(
+            "[Fable2Morph] HostSurface create base=%08X size=%ux%u fmt=%u "
+            "signed=%u tiled=%u seeded=%u host_fmt=%u rtv_fmt=%u",
+            surface_key.base_page, surface_key.width, surface_key.height,
+            static_cast<uint32_t>(surface_key.texture_format),
+            static_cast<uint32_t>(surface_key.signed_mask), key.tiled ? 1 : 0,
+            seeded ? 1 : 0, static_cast<uint32_t>(surface_desc.Format),
+            static_cast<uint32_t>(rtv_format));
+      }
+    }
+#endif  // XE_FABLE2_TRACE_MORPH
+
+    key.host_repacked = 1;
+    D3D12_RESOURCE_STATES current_state = *shared_state;
+    return std::unique_ptr<TextureCache::Texture>(
+        new D3D12Texture(*this, key, resource, current_state, shared_state));
+  }
+
   D3D12_RESOURCE_DESC desc = {};
 
-  if (IsMorphFormat(key)) {
-    desc.Format = GetMorphResourceFormat(key.format);
-  } else {
-    desc.Format = GetDXGIResourceFormat(key);
-  }
+  desc.Format = GetDXGIResourceFormat(key);
   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
     unsupported_format_features_used_[uint32_t(key.format)] |=
         kUnsupportedResourceBit;
@@ -1539,11 +1575,29 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
-  if (IsK8888A(texture_key.format)) {
-    return UploadK8888ATexture(d3d12_texture, load_base, load_mips);
-  }
-  if (IsPlain16Bit(texture_key.format)) {
-    return UploadPlain16BitTexture(d3d12_texture, load_base, load_mips);
+  if (IsMorphFormat(texture_key)) {
+    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+    surface_key.base_page = texture_key.base_page;
+    surface_key.texture_format = texture_key.format;
+    surface_key.width = texture_key.GetWidth();
+    surface_key.height = texture_key.GetHeight();
+    surface_key.signed_mask = static_cast<uint8_t>(texture_key.signed_mask);
+    ID3D12Resource* host_surface_resource = nullptr;
+    D3D12_RESOURCE_STATES* host_surface_state = nullptr;
+    bool host_surface_seeded = false;
+    command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
+        surface_key, host_surface_resource, host_surface_state,
+        host_surface_seeded);
+    if (host_surface_seeded) {
+      return true;
+    }
+
+    if (IsK8888A(texture_key.format)) {
+      return UploadK8888ATexture(d3d12_texture, load_base, load_mips);
+    }
+    if (IsPlain16Bit(texture_key.format)) {
+      return UploadPlain16BitTexture(d3d12_texture, load_base, load_mips);
+    }
   }
   bool adopt_host_surface =
       texture_key.host_repacked &&
@@ -2051,7 +2105,30 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
   }
   xenos::TextureFormat format = texture_key.format;
   if (IsMorphFormat(texture_key)) {
-    desc.Format = texture.resource()->GetDesc().Format;
+    if (IsK8888A(texture_key.format)) {
+      desc.Format = use_signed_view ? DXGI_FORMAT_R8G8B8A8_SNORM
+                                    : DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else {
+      DXGI_FORMAT resource_format = texture.resource()->GetDesc().Format;
+      switch (resource_format) {
+        case DXGI_FORMAT_R16_TYPELESS:
+          desc.Format = use_signed_view ? DXGI_FORMAT_R16_SNORM
+                                        : DXGI_FORMAT_R16_UNORM;
+          break;
+        case DXGI_FORMAT_R16G16_TYPELESS:
+          desc.Format = use_signed_view ? DXGI_FORMAT_R16G16_SNORM
+                                        : DXGI_FORMAT_R16G16_UNORM;
+          break;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+          desc.Format = use_signed_view ? DXGI_FORMAT_R16G16B16A16_SNORM
+                                        : DXGI_FORMAT_R16G16B16A16_UNORM;
+          break;
+        default:
+          desc.Format = use_signed_view ? DXGI_FORMAT_R16G16B16A16_SNORM
+                                        : DXGI_FORMAT_R16G16B16A16_UNORM;
+          break;
+      }
+    }
   } else if (use_signed_view) {
     // Not supporting signed compressed textures - hopefully DXN and DXT5A are
     // not used as signed.
@@ -2064,6 +2141,23 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
         is_signed ? kUnsupportedSnormBit : kUnsupportedUnormBit;
     return UINT32_MAX;
   }
+
+#if XE_FABLE2_TRACE_MORPH
+  if (IsMorphFormat(texture_key)) {
+    uint64_t log_hash = (uint64_t(texture_key.base_page) << 32) ^
+                        (uint64_t(desc.Format) << 8) ^
+                        uint64_t(descriptor_key.host_swizzle) ^
+                        (use_signed_view ? 0x1 : 0x0);
+    static std::unordered_set<uint64_t> logged_morph_srvs;
+    if (logged_morph_srvs.insert(log_hash).second) {
+      XELOGI(
+          "[Fable2Morph] SRV create base=%08X fmt=%u signed=%u dxgi=%u mipMax=%u",
+          texture_key.base_page, static_cast<uint32_t>(texture_key.format),
+          use_signed_view ? 1u : 0u, static_cast<uint32_t>(desc.Format),
+          texture_key.mip_max_level);
+    }
+  }
+#endif  // XE_FABLE2_TRACE_MORPH
 
   uint32_t mip_levels = texture_key.mip_max_level + 1;
   switch (texture_key.dimension) {
@@ -2366,6 +2460,12 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+  D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+  surface_key.base_page = key.base_page;
+  surface_key.texture_format = key.format;
+  surface_key.width = width;
+  surface_key.height = height;
+  surface_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
 
 #if XENIA_MORPH_EARLY_RED
   // SANITY #1: upload solid red to ensure this path feeds the shader.
@@ -2463,9 +2563,20 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   }
 
   texture.MarkAsUsed();
+  command_processor_.render_target_cache().MarkHostSurfaceSeeded(surface_key);
   return true;
 #endif  // XENIA_MORPH_EARLY_RED
 
+#if XE_FABLE2_SOLID_COLOR
+  const uint64_t pixel_count = uint64_t(width) * uint64_t(height);
+  std::vector<uint8_t> rgba(pixel_count * 4u);
+  for (uint64_t i = 0; i < pixel_count; ++i) {
+    rgba[i * 4 + 0] = 255;
+    rgba[i * 4 + 1] = 0;
+    rgba[i * 4 + 2] = 0;
+    rgba[i * 4 + 3] = 255;
+  }
+#else
   // Read guest morph planes. Alpha stored as 16-bit, RGB as 24-bit.
   uint64_t pixel_count = uint64_t(width) * uint64_t(height);
   uint64_t alpha_plane_size = pixel_count * 2u;
@@ -2477,23 +2588,26 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
 
   uint32_t base_address = key.base_page << 12;
   uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
-  if (uint64_t(base_address) > buffer_size_bytes || total_size > buffer_size_bytes ||
+  if (uint64_t(base_address) > buffer_size_bytes ||
+      total_size > buffer_size_bytes ||
       uint64_t(base_address) + total_size > buffer_size_bytes) {
     return false;
   }
 
   if (!shared_memory().RequestRange(
-          base_address, xe::align(uint32_t(total_size), uint32_t(16)), nullptr)) {
+          base_address, xe::align(uint32_t(total_size), uint32_t(16)),
+          nullptr)) {
     return false;
   }
   const auto& d3d12_shared_memory =
       static_cast<const D3D12SharedMemory&>(shared_memory());
-  const uint8_t* alpha_src = d3d12_shared_memory.TranslatePhysical(base_address);
+  const uint8_t* alpha_src =
+      d3d12_shared_memory.TranslatePhysical(base_address);
   if (!alpha_src) {
     return false;
   }
-  const uint8_t* rgb_src =
-      d3d12_shared_memory.TranslatePhysical(base_address + uint32_t(alpha_plane_size));
+  const uint8_t* rgb_src = d3d12_shared_memory.TranslatePhysical(
+      base_address + uint32_t(alpha_plane_size));
   if (!rgb_src) {
     return false;
   }
@@ -2507,7 +2621,8 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
       uint16_t a16;
       std::memcpy(&a16, alpha_src + i * 2u, sizeof(a16));
       a16 = xenos::GpuSwap(a16, key.endianness);
-      uint8_t a8 = kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
+      uint8_t a8 =
+          kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
 
       const uint8_t* rgb = rgb_src + i * 3u;
       uint8_t r = rgb[2];
@@ -2537,16 +2652,17 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
     for (uint32_t y = 0; y < height; ++y) {
       for (uint32_t x = 0; x < width; ++x) {
         // Alpha comes from the first plane (16-bit per texel).
-        uint32_t a_off = static_cast<uint32_t>(
-            GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks_alpha, bpb_log2_alpha));
+        uint32_t a_off = static_cast<uint32_t>(GetTiledOffset2D(
+            int32_t(x), int32_t(y), pitch_blocks_alpha, bpb_log2_alpha));
         uint16_t a16;
         std::memcpy(&a16, alpha_src + a_off, sizeof(a16));
         a16 = xenos::GpuSwap(a16, key.endianness);
-        uint8_t a8 = kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
+        uint8_t a8 =
+            kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
 
         // RGB comes from the second plane, assuming 4 bytes per texel tiles.
-        uint32_t rgb_off = static_cast<uint32_t>(
-            GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks_rgb, bpb_log2_rgb));
+        uint32_t rgb_off = static_cast<uint32_t>(GetTiledOffset2D(
+            int32_t(x), int32_t(y), pitch_blocks_rgb, bpb_log2_rgb));
         const uint8_t* rgbp = rgb_src + rgb_off;
         uint8_t r = rgbp[2];
         uint8_t g = rgbp[1];
@@ -2567,6 +2683,7 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
       }
     }
   }
+#endif  // XE_FABLE2_SOLID_COLOR
   D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
   texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
@@ -2647,6 +2764,7 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   command_processor_.SubmitBarriers();
 
   texture.MarkAsUsed();
+  command_processor_.render_target_cache().MarkHostSurfaceSeeded(surface_key);
   return true;
 }
 
@@ -2691,6 +2809,14 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
     base_size = row_pitch_bytes * height;
   }
 
+  D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
+  surface_key.base_page = key.base_page;
+  surface_key.texture_format = key.format;
+  surface_key.width = width;
+  surface_key.height = height;
+  surface_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
+
+#if !XE_FABLE2_SOLID_COLOR
   if (!shared_memory().RequestRange(
           base_address, xe::align(base_size, uint32_t(16)), nullptr)) {
     return false;
@@ -2701,12 +2827,45 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
   if (!base_ptr) {
     return false;
   }
+#endif
 
-  std::vector<uint16_t> staging(width * height * 4u);
   using DirectX::PackedVector::XMConvertFloatToHalf;
   const uint16_t half_zero = XMConvertFloatToHalf(0.0f);
   const uint16_t half_one = XMConvertFloatToHalf(1.0f);
 
+  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
+  DXGI_FORMAT upload_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  uint32_t host_components = 4;
+  switch (texture_desc.Format) {
+    case DXGI_FORMAT_R16_TYPELESS:
+      upload_format = DXGI_FORMAT_R16_FLOAT;
+      host_components = 1;
+      break;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+      upload_format = DXGI_FORMAT_R16G16_FLOAT;
+      host_components = 2;
+      break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+      upload_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      host_components = 4;
+      break;
+    default:
+      upload_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      host_components = 4;
+      break;
+  }
+
+  std::vector<uint16_t> staging(width * height * host_components, half_zero);
+
+#if XE_FABLE2_SOLID_COLOR
+  for (uint32_t i = 0; i < width * height; ++i) {
+    size_t idx = size_t(i) * host_components;
+    staging[idx + 0] = half_one;
+    if (host_components > 3) {
+      staging[idx + 3] = half_one;
+    }
+  }
+#else
   for (uint32_t y = 0; y < height; ++y) {
     for (uint32_t x = 0; x < width; ++x) {
       const uint8_t* texel_ptr;
@@ -2718,9 +2877,11 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
             int32_t(x), int32_t(y), pitch_blocks, bpb_log2));
         texel_ptr = base_ptr + offset;
       }
-      size_t idx = (size_t(y) * width + x) * 4u;
-      uint16_t packed[4] = {half_zero, half_zero, half_zero, half_one};
-      for (uint32_t c = 0; c < component_count; ++c) {
+      size_t idx = (size_t(y) * width + x) * host_components;
+      if (host_components >= 4) {
+        staging[idx + 3] = half_one;
+      }
+      for (uint32_t c = 0; c < component_count && c < host_components; ++c) {
         uint16_t raw;
         std::memcpy(&raw, texel_ptr + c * sizeof(uint16_t), sizeof(raw));
         raw = xenos::GpuSwap(raw, key.endianness);
@@ -2730,19 +2891,19 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
         } else {
           v = float(raw) / 65535.0f;
         }
-        packed[c] = XMConvertFloatToHalf(v);
+        staging[idx + c] = XMConvertFloatToHalf(v);
       }
-      std::memcpy(staging.data() + idx, packed, sizeof(packed));
     }
   }
+#endif  // XE_FABLE2_SOLID_COLOR
+
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
-
-  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
 
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT num_rows = 0;
   UINT64 row_size_bytes = 0, upload_size = 0;
+  texture_desc.Format = upload_format;
   device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
                                 &row_size_bytes, &upload_size);
   if (!num_rows || !upload_size) {
@@ -2768,7 +2929,7 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
       return false;
     }
     uint8_t* dst = map + footprint.Offset;
-    const size_t src_row_bytes = size_t(width) * 4u * sizeof(uint16_t);
+    const size_t src_row_bytes = size_t(width) * host_components * sizeof(uint16_t);
     for (UINT row = 0; row < num_rows; ++row) {
       uint8_t* dst_row = dst + row * footprint.Footprint.RowPitch;
       const uint8_t* src_row =
@@ -2830,6 +2991,7 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
   }
 
   texture.MarkAsUsed();
+  command_processor_.render_target_cache().MarkHostSurfaceSeeded(surface_key);
   return true;
 }
 

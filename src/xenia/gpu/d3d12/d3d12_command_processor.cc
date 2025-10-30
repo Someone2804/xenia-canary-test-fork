@@ -1688,120 +1688,6 @@ bool D3D12CommandProcessor::SetupContext() {
                           uint32_t(SystemBindlessView::kGammaRampPWLSRV)));
   }
 
-  if (!debug_red_texture_) {
-    D3D12_RESOURCE_DESC red_desc{};
-    red_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    red_desc.Alignment = 0;
-    red_desc.Width = 1;
-    red_desc.Height = 1;
-    red_desc.DepthOrArraySize = 1;
-    red_desc.MipLevels = 1;
-    red_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    red_desc.SampleDesc.Count = 1;
-    red_desc.SampleDesc.Quality = 0;
-    red_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    red_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    Microsoft::WRL::ComPtr<ID3D12Resource> red_resource;
-    if (SUCCEEDED(device->CreateCommittedResource(
-            &ui::d3d12::util::kHeapPropertiesDefault,
-            provider.GetHeapFlagCreateNotZeroed(), &red_desc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-            IID_PPV_ARGS(&red_resource)))) {
-      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-      UINT num_rows = 0;
-      UINT64 row_bytes = 0;
-      UINT64 upload_size = 0;
-      device->GetCopyableFootprints(&red_desc, 0, 1, 0, &footprint, &num_rows,
-                                    &row_bytes, &upload_size);
-      if (num_rows && upload_size) {
-        D3D12_RESOURCE_DESC upload_desc{};
-        ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
-                                                D3D12_RESOURCE_FLAG_NONE);
-        Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
-        if (SUCCEEDED(device->CreateCommittedResource(
-                &ui::d3d12::util::kHeapPropertiesUpload,
-                provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                IID_PPV_ARGS(&upload_buffer)))) {
-          uint8_t* upload_mapping = nullptr;
-          D3D12_RANGE read_range{0, 0};
-          if (SUCCEEDED(upload_buffer->Map(
-                  0, &read_range, reinterpret_cast<void**>(&upload_mapping)))) {
-            uint8_t* dst_bytes = upload_mapping + footprint.Offset;
-            std::memset(dst_bytes, 0,
-                        size_t(num_rows) * footprint.Footprint.RowPitch);
-            dst_bytes[0] = 255;
-            dst_bytes[1] = 0;
-            dst_bytes[2] = 0;
-            dst_bytes[3] = 255;
-            D3D12_RANGE written_range{
-                footprint.Offset,
-                footprint.Offset +
-                    UINT64(num_rows) * footprint.Footprint.RowPitch};
-            upload_buffer->Unmap(0, &written_range);
-
-            Microsoft::WRL::ComPtr<ID3D12CommandAllocator> upload_allocator;
-            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> upload_list;
-            if (SUCCEEDED(device->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    IID_PPV_ARGS(&upload_allocator))) &&
-                SUCCEEDED(device->CreateCommandList(
-                    0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    upload_allocator.Get(), nullptr,
-                    IID_PPV_ARGS(&upload_list)))) {
-              bool copy_completed = false;
-              D3D12_TEXTURE_COPY_LOCATION src_location{};
-              src_location.pResource = upload_buffer.Get();
-              src_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-              src_location.PlacedFootprint = footprint;
-              D3D12_TEXTURE_COPY_LOCATION dst_location{};
-              dst_location.pResource = red_resource.Get();
-              dst_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-              dst_location.SubresourceIndex = 0;
-              upload_list->CopyTextureRegion(&dst_location, 0, 0, 0,
-                                             &src_location, nullptr);
-              D3D12_RESOURCE_BARRIER barrier;
-              barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-              barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-              barrier.Transition.pResource = red_resource.Get();
-              barrier.Transition.Subresource =
-                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-              barrier.Transition.StateBefore =
-                  D3D12_RESOURCE_STATE_COPY_DEST;
-              barrier.Transition.StateAfter =
-                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              upload_list->ResourceBarrier(1, &barrier);
-              upload_list->Close();
-              ID3D12CommandList* execute_lists[] = {upload_list.Get()};
-              direct_queue->ExecuteCommandLists(1, execute_lists);
-              Microsoft::WRL::ComPtr<ID3D12Fence> upload_fence;
-              if (SUCCEEDED(device->CreateFence(
-                      0, D3D12_FENCE_FLAG_NONE,
-                      IID_PPV_ARGS(&upload_fence)))) {
-                HANDLE fence_event = CreateEvent(nullptr, false, false, nullptr);
-                if (fence_event) {
-                  constexpr uint64_t kFenceValue = 1;
-                  if (SUCCEEDED(
-                          direct_queue->Signal(upload_fence.Get(), kFenceValue)) &&
-                      SUCCEEDED(upload_fence->SetEventOnCompletion(kFenceValue,
-                                                                   fence_event))) {
-                    WaitForSingleObject(fence_event, INFINITE);
-                    copy_completed = true;
-                  }
-                  CloseHandle(fence_event);
-                }
-              }
-              if (copy_completed) {
-                debug_red_texture_ = red_resource.Detach();
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
 
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
@@ -1821,8 +1707,6 @@ void D3D12CommandProcessor::ShutdownContext() {
   ui::d3d12::util::ReleaseAndNull(debug_red_texture_);
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
-
-  ui::d3d12::util::ReleaseAndNull(debug_red_texture_);
 
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
