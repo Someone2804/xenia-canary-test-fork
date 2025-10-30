@@ -142,7 +142,7 @@ bool D3D12Provider::Initialize() {
   libraries_loaded &=
       (pfn_dxgi_get_debug_interface1_ = PFNDXGIGetDebugInterface1(
            GetProcAddress(library_dxgi_, "DXGIGetDebugInterface1"))) != nullptr;
-  #define XE_ENABLE_D3D12_DEBUG 1
+  #define XE_ENABLE_D3D12_DEBUG 0
   #if XE_ENABLE_D3D12_DEBUG
   {
     // D3D12GetDebugInterface через GetProcAddress — без линковки d3d12.lib

@@ -2224,7 +2224,11 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   const D3D12_RESOURCE_STATES ps =
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-  command_processor_.PushTransitionBarrier(host_res, D3D12_RESOURCE_STATE_COPY_DEST, ps);
+  command_processor_.PushTransitionBarrier(
+      texture.resource(),
+      D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   command_processor_.SubmitBarriers();
   if (shared_state) *shared_state = ps;
 
@@ -2399,7 +2403,11 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
   const D3D12_RESOURCE_STATES ps =
       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-  command_processor_.PushTransitionBarrier(host_res, D3D12_RESOURCE_STATE_COPY_DEST, ps);
+  command_processor_.PushTransitionBarrier(
+      texture.resource(),
+      D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   command_processor_.SubmitBarriers();
   if (shared_state) *shared_state = ps;
 

@@ -5838,6 +5838,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       are_current_command_list_render_targets_valid_ = false;
       if (dest_rt_key.is_depth) {
         auto handle = dest_d3d12_rt.descriptor_draw().GetHandle();
+        TransitionRenderTargetToState(dest_d3d12_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
         command_processor_.SubmitBarriers();
         command_list.D3DOMSetRenderTargets(0, nullptr, false, &handle);
         if (!use_stencil_reference_output_) {
@@ -5851,6 +5852,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.resource()->GetDesc();
         assert_true((render_target_desc.Flags &
                      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
+        TransitionRenderTargetToState(dest_d3d12_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
         command_processor_.SubmitBarriers();
         command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
       }
@@ -6471,6 +6473,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           assert_true((render_target_desc.Flags &
                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0);
 
+          TransitionRenderTargetToState(dest_d3d12_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
           command_processor_.SubmitBarriers();
 
           command_list.D3DOMSetRenderTargets(1, &handle, false, nullptr);
