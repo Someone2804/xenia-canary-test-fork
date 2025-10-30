@@ -138,7 +138,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
     return view_bindless_heap_gpu_start_;
   }
 
-  ID3D12Resource* GetDebugRedTexture() const { return debug_red_texture_; }
   // Returns UINT32_MAX if no free descriptors. If the unbounded SRV range for
   // bindless resources is also used in the root signature of the draw /
   // dispatch referencing this descriptor, this must only be used to allocate
@@ -698,6 +697,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
+  ID3D12Resource* debug_red_texture_ = nullptr;
   ID3D12Resource* scratch_buffer_ = nullptr;
   uint32_t scratch_buffer_size_ = 0;
   D3D12_RESOURCE_STATES scratch_buffer_state_;
@@ -706,7 +706,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
 
-  ID3D12Resource* debug_red_texture_ = nullptr;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;

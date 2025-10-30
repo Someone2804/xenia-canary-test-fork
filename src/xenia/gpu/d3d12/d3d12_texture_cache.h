@@ -739,6 +739,8 @@ class D3D12TextureCache final : public TextureCache {
     return GetDXGIUnormFormat(key.format, key.GetWidth(), key.GetHeight());
   }
 
+  static bool IsMorphFormat(const TextureKey& key);
+
   bool UploadK8888ATexture(D3D12Texture& texture, bool load_base,
                            bool load_mips);
   bool UploadPlain16BitTexture(D3D12Texture& texture, bool load_base,

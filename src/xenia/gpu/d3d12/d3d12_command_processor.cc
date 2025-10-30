@@ -1802,6 +1802,7 @@ bool D3D12CommandProcessor::SetupContext() {
     }
   }
 
+
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
 
@@ -1817,10 +1818,12 @@ void D3D12CommandProcessor::ShutdownContext() {
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
 
+  ui::d3d12::util::ReleaseAndNull(debug_red_texture_);
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
 
   ui::d3d12::util::ReleaseAndNull(debug_red_texture_);
+
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
        resources_for_deletion_) {
