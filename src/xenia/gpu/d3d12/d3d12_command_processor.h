@@ -137,6 +137,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
     assert_true(bindless_resources_used_);
     return view_bindless_heap_gpu_start_;
   }
+
+  ID3D12Resource* GetDebugRedTexture() const { return debug_red_texture_; }
   // Returns UINT32_MAX if no free descriptors. If the unbounded SRV range for
   // bindless resources is also used in the root signature of the draw /
   // dispatch referencing this descriptor, this must only be used to allocate
@@ -703,6 +705,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
+
+  ID3D12Resource* debug_red_texture_ = nullptr;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;

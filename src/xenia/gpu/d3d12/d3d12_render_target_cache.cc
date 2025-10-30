@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -1490,7 +1491,7 @@ D3D12RenderTargetCache::HostSurface* D3D12RenderTargetCache::EnsureHostSurface(
   } else {
     srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv_desc.Texture2D.MostDetailedMip = 0;
-    srv_desc.Texture2D.MipLevels = 1;
+    srv_desc.Texture2D.MipLevels = resource_desc.MipLevels;
     srv_desc.Texture2D.PlaneSlice = 0;
     srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
   }
