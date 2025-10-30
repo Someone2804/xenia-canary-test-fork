@@ -75,9 +75,10 @@ static inline DXGI_FORMAT TypelessForMorph(xenos::TextureFormat f) {
 }
 
 // Выбор формата SRV без зависимости от TextureKey
-static inline DXGI_FORMAT SRVForMorph(xenos::TextureFormat fmt, uint32_t signed_mask) {
+static inline DXGI_FORMAT SRVForMorph(xenos::TextureFormat fmt, uint32_t /*signed_mask*/) {
   if (IsK8888A(fmt)) {
-    return signed_mask ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Избегаем SNORM: только UNORM. Это снимает риск INVALID_CALL у драйвера.
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
   }
   switch (GetComponentCountForPlain16Bit(fmt)) {
     case 1: return DXGI_FORMAT_R16_FLOAT;
@@ -1399,7 +1400,9 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
   desc.SampleDesc.Count = 1;
   desc.SampleDesc.Quality = 0;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  desc.Flags = D3D12_RESOURCE_FLAG_NONE;  // SRV-only. Никаких RTV для morph.
+  desc.Flags = (IsK8888A(key.format) || IsPlain16BitFormat(key.format))
+                            ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                            : D3D12_RESOURCE_FLAG_NONE;
 
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
@@ -2147,7 +2150,7 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   ID3D12Resource* host_res = nullptr;
   D3D12_RESOURCE_STATES* shared_state = nullptr;
   bool seeded = false;
-  DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_R8G8B8A8_UNORM;
   if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
           hs_key, host_res, shared_state, seeded, &rtv_fmt_dummy)) {
     return false;
