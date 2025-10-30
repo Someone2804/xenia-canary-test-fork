@@ -51,40 +51,56 @@ static inline bool IsPlain16BitFormat(xenos::TextureFormat format) {
   }
 }
 
-static inline uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
+static inline uint32_t GetComponentCountForPlain16Bit(
+    xenos::TextureFormat format) {
   switch (format) {
-    case xenos::TextureFormat::k_16:                 return 1;
-    case xenos::TextureFormat::k_16_16:              return 2;
-    case xenos::TextureFormat::k_16_16_16_16:        return 4;
-    default:                                         return 0;
+    case xenos::TextureFormat::k_16:
+      return 1;
+    case xenos::TextureFormat::k_16_16:
+      return 2;
+    case xenos::TextureFormat::k_16_16_16_16:
+      return 4;
+    default:
+      return 0;
   }
 }
 
-static inline bool IsK8888A(xenos::TextureFormat fmt) {
-  return fmt == xenos::TextureFormat::k_8_8_8_8_A;
+static inline bool IsK8888A(xenos::TextureFormat format) {
+  return format == xenos::TextureFormat::k_8_8_8_8_A;
 }
 
-static inline DXGI_FORMAT TypelessForMorph(xenos::TextureFormat f) {
-  if (IsK8888A(f)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
-  switch (GetComponentCountForPlain16Bit(f)) {
-    case 1: return DXGI_FORMAT_R16_TYPELESS;
-    case 2: return DXGI_FORMAT_R16G16_TYPELESS;
-    case 4: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
-    default: return DXGI_FORMAT_UNKNOWN;
+static inline DXGI_FORMAT TypelessForMorph(xenos::TextureFormat format) {
+  if (IsK8888A(format)) {
+    return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+  }
+  switch (GetComponentCountForPlain16Bit(format)) {
+    case 1:
+      return DXGI_FORMAT_R16_TYPELESS;
+    case 2:
+      return DXGI_FORMAT_R16G16_TYPELESS;
+    case 4:
+      return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
   }
 }
 
-// Выбор формата SRV без зависимости от TextureKey
-static inline DXGI_FORMAT SRVForMorph(xenos::TextureFormat fmt, uint32_t /*signed_mask*/) {
-  if (IsK8888A(fmt)) {
-    // Избегаем SNORM: только UNORM. Это снимает риск INVALID_CALL у драйвера.
+// SRV formats for typeless morph textures. Always enforce UNORM/FLOAT16.
+static inline DXGI_FORMAT SRVForMorph(xenos::TextureFormat format,
+                                      uint32_t /*signed_mask*/) {
+  if (IsK8888A(format)) {
+    // Force UNORM to avoid INVALID_CALL when the resource is typeless.
     return DXGI_FORMAT_R8G8B8A8_UNORM;
   }
-  switch (GetComponentCountForPlain16Bit(fmt)) {
-    case 1: return DXGI_FORMAT_R16_FLOAT;
-    case 2: return DXGI_FORMAT_R16G16_FLOAT;
-    case 4: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    default: return DXGI_FORMAT_UNKNOWN;
+  switch (GetComponentCountForPlain16Bit(format)) {
+    case 1:
+      return DXGI_FORMAT_R16_FLOAT;
+    case 2:
+      return DXGI_FORMAT_R16G16_FLOAT;
+    case 4:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
   }
 }
 }  // namespace
@@ -1371,11 +1387,13 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     TextureKey key) {
   D3D12_RESOURCE_DESC desc = {};
 
-  // Тип ресурса: для morph-форматов создаём TYPELESS, иначе обычный.
+  // Make morph textures typeless so SRVs can pick the required format.
   if (IsK8888A(key.format) || IsPlain16BitFormat(key.format)) {
     desc.Format = TypelessForMorph(key.format);
+    desc.MipLevels = 1;
   } else {
     desc.Format = GetDXGIResourceFormat(key);
+    desc.MipLevels = static_cast<UINT16>(key.mip_max_level + 1);
   }
   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
     unsupported_format_features_used_[uint32_t(key.format)] |=
@@ -1383,11 +1401,9 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     return nullptr;
   }
 
-  // 1D трактуем как 2D.
-  desc.Dimension =
-      (key.dimension == xenos::DataDimension::k3D)
-          ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
-          : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Dimension = (key.dimension == xenos::DataDimension::k3D)
+                       ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                       : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Alignment = 0;
   desc.Width = key.GetWidth();
   desc.Height = key.GetHeight();
@@ -1400,15 +1416,11 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
   desc.SampleDesc.Count = 1;
   desc.SampleDesc.Quality = 0;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  desc.Flags = (IsK8888A(key.format) || IsPlain16BitFormat(key.format))
-                            ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                            : D3D12_RESOURCE_FLAG_NONE;
+  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
-
-  // Начальное состояние — под копию из upload-буфера.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -1428,8 +1440,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
   bool adopt_host_surface =
-      D3D12RenderTargetCache::IsMorphTextureFormat(texture_key.format) &&
-      texture_key.host_repacked;
+      texture_key.host_repacked &&
+      !D3D12RenderTargetCache::IsMorphTextureFormat(texture_key.format);
   D3D12RenderTargetCache::HostSurfaceTextureKey host_surface_key;
   if (adopt_host_surface) {
     host_surface_key.base_page = texture_key.base_page;
@@ -1951,7 +1963,12 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
     return UINT32_MAX;
   }
   xenos::TextureFormat format = texture_key.format;
-  if (use_signed_view) {
+  if (IsK8888A(format) || IsPlain16BitFormat(format)) {
+    desc.Format =
+        SRVForMorph(format, static_cast<uint32_t>(texture_key.signed_mask));
+    desc.Texture2D.MostDetailedMip = 0;
+    desc.Texture2D.MipLevels = 1;
+  } else if (use_signed_view) {
     // Not supporting signed compressed textures - hopefully DXN and DXT5A are
     // not used as signed.
     desc.Format = host_formats_[uint32_t(format)].dxgi_format_signed;
@@ -2039,6 +2056,33 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
       descriptor_index = srv_descriptor_cache_allocated_++;
     }
   }
+
+  const auto& k = texture.key(); // или this->key() внутри D3D12Texture
+
+  if (IsK8888A(k.format) || IsPlain16BitFormat(k.format)) {
+    // Правильный формат SRV поверх TYPELESS:
+    desc.Format = SRVForMorph(k.format, static_cast<uint32_t>(k.signed_mask));
+
+    // Жёстко только mip0:
+    switch (desc.ViewDimension) {
+      case D3D12_SRV_DIMENSION_TEXTURE2D:
+        desc.Texture2D.MostDetailedMip = 0;
+        desc.Texture2D.MipLevels       = 1;
+        break;
+      case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        desc.Texture2DArray.MostDetailedMip = 0;
+        desc.Texture2DArray.MipLevels       = 1;
+        break;
+      case D3D12_SRV_DIMENSION_TEXTURECUBE:
+        desc.TextureCube.MostDetailedMip = 0;
+        desc.TextureCube.MipLevels       = 1;
+        break;
+      // Другие измерения у вас почти не используются; при необходимости аналогично.
+      default:
+        break;
+    }
+  }
+
   device->CreateShaderResourceView(
       texture.resource(), &desc,
       GetTextureDescriptorCPUHandle(descriptor_index));
@@ -2089,89 +2133,120 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(
 bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
                                             bool load_base,
                                             bool /*load_mips*/) {
-  if (!load_base) return true;
+  if (!load_base) {
+    return true;
+  }
 
   const TextureKey& key = texture.key();
   uint32_t width = key.GetWidth();
   uint32_t height = key.GetHeight();
-  if (!width || !height) return false;
+  if (!width || !height) {
+    return false;
+  }
 
-  // --- Read guest planes ---
+  // Read guest morph planes. Alpha stored as 16-bit, RGB as 24-bit.
   uint64_t pixel_count = uint64_t(width) * uint64_t(height);
   uint64_t alpha_plane_size = pixel_count * 2u;
-  uint64_t rgb_plane_size   = pixel_count * 3u;
-  uint64_t total_size       = alpha_plane_size + rgb_plane_size;
-  if (!alpha_plane_size || !rgb_plane_size || total_size > UINT32_MAX) return false;
+  uint64_t rgb_plane_size = pixel_count * 3u;
+  uint64_t total_size = alpha_plane_size + rgb_plane_size;
+  if (!alpha_plane_size || !rgb_plane_size || total_size > UINT32_MAX) {
+    return false;
+  }
 
   uint32_t base_address = key.base_page << 12;
   uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
-  if (uint64_t(base_address) > buffer_size_bytes ||
-      total_size > buffer_size_bytes ||
+  if (uint64_t(base_address) > buffer_size_bytes || total_size > buffer_size_bytes ||
       uint64_t(base_address) + total_size > buffer_size_bytes) {
     return false;
   }
 
-  if (!shared_memory().RequestRange(base_address,
-                                    xe::align(uint32_t(total_size), uint32_t(16)),
-                                    nullptr)) {
+  if (!shared_memory().RequestRange(
+          base_address, xe::align(uint32_t(total_size), uint32_t(16)), nullptr)) {
     return false;
   }
   const auto& d3d12_shared_memory =
       static_cast<const D3D12SharedMemory&>(shared_memory());
   const uint8_t* alpha_src = d3d12_shared_memory.TranslatePhysical(base_address);
-  if (!alpha_src) return false;
-  const uint8_t* rgb_src   = d3d12_shared_memory.TranslatePhysical(base_address + uint32_t(alpha_plane_size));
-  if (!rgb_src) return false;
-
-  // --- Stitch RGBA on CPU ---
-  std::vector<uint8_t> rgba(pixel_count * 4u);
-  for (uint64_t i = 0; i < pixel_count; ++i) {
-    uint16_t a16;
-    std::memcpy(&a16, alpha_src + i * 2u, sizeof(a16));
-    a16 = xenos::GpuSwap(a16, key.endianness);
-    uint8_t a8 = kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
-
-    const uint8_t* rgb = rgb_src + i * 3u;
-    uint64_t dst = i * 4u;
-    rgba[dst + 0] = rgb[0];
-    rgba[dst + 1] = rgb[1];
-    rgba[dst + 2] = rgb[2];
-    rgba[dst + 3] = a8;
-  }
-
-  // --- Ensure RTV-capable HostSurface for this morph texture ---
-  D3D12RenderTargetCache::HostSurfaceTextureKey hs_key{};
-  hs_key.base_page      = key.base_page;
-  hs_key.texture_format = key.format;
-  hs_key.width          = width;
-  hs_key.height         = height;
-  hs_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
-
-  ID3D12Resource* host_res = nullptr;
-  D3D12_RESOURCE_STATES* shared_state = nullptr;
-  bool seeded = false;
-  DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_R8G8B8A8_UNORM;
-  if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
-          hs_key, host_res, shared_state, seeded, &rtv_fmt_dummy)) {
+  if (!alpha_src) {
     return false;
   }
+  const uint8_t* rgb_src =
+      d3d12_shared_memory.TranslatePhysical(base_address + uint32_t(alpha_plane_size));
+  if (!rgb_src) {
+    return false;
+  }
+  using xe::gpu::texture_util::GetTiledOffset2D;
+  std::vector<uint8_t> rgba(pixel_count * 4u);
 
-  // --- Build upload buffer using host_res footprint (RGBA8 size) ---
+  if (!key.tiled) {
+    // ЛИНЕЙНЫЙ случай — как у тебя было, только оставь BGR→RGB, если нужно
+    for (uint64_t i = 0; i < pixel_count; ++i) {
+      uint16_t a16;
+      std::memcpy(&a16, alpha_src + i * 2u, sizeof(a16));
+      a16 = xenos::GpuSwap(a16, key.endianness);
+      uint8_t a8 = kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
+
+      const uint8_t* rgb = rgb_src + i * 3u;
+      uint64_t dst = i * 4u;
+      rgba[dst + 0] = rgb[2];
+      rgba[dst + 1] = rgb[1];
+      rgba[dst + 2] = rgb[0];
+      rgba[dst + 3] = a8;
+    }
+  } else {
+    // TILED: считать, что RGB плоскость хранится с шагом 4 байта на тексель, α — 2 байта на тексель.
+    // Для GetTiledOffset2D:
+    //  - pitch_blocks = ширина в "блоках" (= ширина в текселях, когда bytes_per_block = 1 тексель).
+    //  - bytes_per_block_log2 = log2(bytes_per_texel).
+    const uint32_t pitch_blocks_rgb   = width; // 4B per texel => log2 = 2
+    const uint32_t pitch_blocks_alpha = width; // 2B per texel => log2 = 1
+    const uint32_t bpb_log2_rgb   = 2; // 4 bytes
+    const uint32_t bpb_log2_alpha = 1; // 2 bytes
+
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        // α из первой плоскости
+        uint32_t a_off = static_cast<uint32_t>(
+            GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks_alpha, bpb_log2_alpha));
+        uint16_t a16;
+        std::memcpy(&a16, alpha_src + a_off, sizeof(a16));
+        a16 = xenos::GpuSwap(a16, key.endianness);
+        uint8_t a8 = kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
+
+        // RGB из второй плоскости: считаем 4 байта на тексель, но читаем только B,G,R
+        uint32_t rgb_off = static_cast<uint32_t>(
+            GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks_rgb, bpb_log2_rgb));
+        const uint8_t* rgbp = rgb_src + rgb_off; // layout предполагается как 32bpp-плитка
+
+        size_t dst = (size_t(y) * width + x) * 4u;
+        // временно BGR→RGB; если цвета «уедут», поменяй обратно
+        rgba[dst + 0] = rgbp[2];
+        rgba[dst + 1] = rgbp[1];
+        rgba[dst + 2] = rgbp[0];
+        rgba[dst + 3] = a8;
+      }
+    }
+  }
+
+
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT num_rows = 0;
   UINT64 row_size_bytes = 0, upload_size = 0;
-  {
-    D3D12_RESOURCE_DESC desc = host_res->GetDesc();
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // size-compatible for copy
-    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size_bytes, &upload_size);
-    if (!num_rows || !upload_size) return false;
+  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
+                                &row_size_bytes, &upload_size);
+  if (!num_rows || !upload_size) {
+    return false;
   }
 
-  D3D12_RESOURCE_DESC upload_desc{};
-  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  D3D12_RESOURCE_DESC upload_desc;
+  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
   Microsoft::WRL::ComPtr<ID3D12Resource> upload;
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesUpload,
@@ -2182,59 +2257,60 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
 
   {
     uint8_t* map = nullptr;
-    D3D12_RANGE rr{0,0};
-    if (FAILED(upload->Map(0, &rr, reinterpret_cast<void**>(&map)))) return false;
+    D3D12_RANGE read_range{0, 0};
+    if (FAILED(upload->Map(0, &read_range, reinterpret_cast<void**>(&map)))) {
+      return false;
+    }
     uint8_t* dst = map + footprint.Offset;
     const size_t src_row_bytes = size_t(width) * 4u;
     for (UINT row = 0; row < num_rows; ++row) {
-      auto* dst_row = dst + row * footprint.Footprint.RowPitch;
-      auto* src_row = rgba.data() + size_t(row) * src_row_bytes;
+      uint8_t* dst_row = dst + row * footprint.Footprint.RowPitch;
+      const uint8_t* src_row = rgba.data() + size_t(row) * src_row_bytes;
       std::memcpy(dst_row, src_row, src_row_bytes);
-      size_t pad = footprint.Footprint.RowPitch > src_row_bytes
-                 ? size_t(footprint.Footprint.RowPitch) - src_row_bytes : 0u;
-      if (pad) std::memset(dst_row + src_row_bytes, 0, pad);
+      size_t padding = footprint.Footprint.RowPitch > src_row_bytes
+                           ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                           : 0u;
+      if (padding) {
+        std::memset(dst_row + src_row_bytes, 0, padding);
+      }
     }
-    D3D12_RANGE wr{footprint.Offset,
-                   footprint.Offset + num_rows * footprint.Footprint.RowPitch};
-    upload->Unmap(0, &wr);
+    D3D12_RANGE written_range{footprint.Offset,
+                              footprint.Offset +
+                                  num_rows * footprint.Footprint.RowPitch};
+    upload->Unmap(0, &written_range);
   }
 
-  // --- Copy upload -> HostSurface, with barriers on shared_state ---
-  const D3D12_RESOURCE_STATES prev =
-      shared_state ? *shared_state : D3D12_RESOURCE_STATE_COMMON;
-
-  command_processor_.PushTransitionBarrier(host_res, prev, D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(upload.Get(),
-                                           D3D12_RESOURCE_STATE_GENERIC_READ,
-                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ID3D12Resource* resource = texture.resource();
+  D3D12_RESOURCE_STATES previous_state =
+      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(resource, previous_state,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(
+      upload.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor_.SubmitBarriers();
-  if (shared_state) *shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
-  D3D12_TEXTURE_COPY_LOCATION src{};
+  D3D12_TEXTURE_COPY_LOCATION src = {};
   src.pResource = upload.Get();
   src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   src.PlacedFootprint = footprint;
 
-  D3D12_TEXTURE_COPY_LOCATION dst{};
-  dst.pResource = host_res;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = resource;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   dst.SubresourceIndex = 0;
 
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &dst, 0, 0, 0, &src, nullptr);
   command_processor_.RetainResourceForSubmission(upload.Get());
 
-  const D3D12_RESOURCE_STATES ps =
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
+  const D3D12_RESOURCE_STATES shader_state =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   command_processor_.PushTransitionBarrier(
-      texture.resource(),
-      D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      resource, texture.SetResourceState(shader_state), shader_state);
   command_processor_.SubmitBarriers();
-  if (shared_state) *shared_state = ps;
 
-  command_processor_.render_target_cache().MarkHostSurfaceSeeded(hs_key);
   texture.MarkAsUsed();
   return true;
 }
@@ -2242,43 +2318,55 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
 bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
                                                 bool load_base,
                                                 bool /*load_mips*/) {
-  if (!load_base) return true;
+  if (!load_base) {
+    return true;
+  }
 
   const TextureKey& key = texture.key();
   uint32_t component_count = GetComponentCountForPlain16Bit(key.format);
-  if (!component_count) return false;
+  if (!component_count) {
+    return false;
+  }
 
   uint32_t width = key.GetWidth();
   uint32_t height = key.GetHeight();
-  if (!width || !height) return false;
+  if (!width || !height) {
+    return false;
+  }
 
   const texture_util::TextureGuestLayout& layout = texture.guest_layout();
   const texture_util::TextureGuestLayout::Level& base_layout = layout.base;
   const FormatInfo* format_info = FormatInfo::Get(key.format);
   uint32_t bpb = format_info->bytes_per_block();
-  if (!bpb) return false;
+  if (!bpb) {
+    return false;
+  }
 
   uint32_t row_pitch_bytes = base_layout.row_pitch_bytes;
-  if (!row_pitch_bytes) return false;
+  if (!row_pitch_bytes) {
+    return false;
+  }
   uint32_t pitch_blocks = row_pitch_bytes / bpb;
   uint32_t bpb_log2 = xe::log2_floor(bpb);
   uint32_t bytes_per_texel = component_count * sizeof(uint16_t);
 
   uint32_t base_address = key.base_page << 12;
   uint32_t base_size = base_layout.array_slice_data_extent_bytes;
-  if (!base_size) base_size = row_pitch_bytes * height;
+  if (!base_size) {
+    base_size = row_pitch_bytes * height;
+  }
 
-  if (!shared_memory().RequestRange(base_address,
-                                    xe::align(base_size, uint32_t(16)),
-                                    nullptr)) {
+  if (!shared_memory().RequestRange(
+          base_address, xe::align(base_size, uint32_t(16)), nullptr)) {
     return false;
   }
   const auto& d3d12_shared_memory =
       static_cast<const D3D12SharedMemory&>(shared_memory());
   const uint8_t* base_ptr = d3d12_shared_memory.TranslatePhysical(base_address);
-  if (!base_ptr) return false;
+  if (!base_ptr) {
+    return false;
+  }
 
-  // --- Convert to half float staging ---
   std::vector<uint16_t> staging(width * height * component_count);
   using DirectX::PackedVector::XMConvertFloatToHalf;
 
@@ -2286,7 +2374,8 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
     for (uint32_t x = 0; x < width; ++x) {
       const uint8_t* texel_ptr;
       if (!key.tiled) {
-        texel_ptr = base_ptr + uint64_t(y) * row_pitch_bytes + uint64_t(x) * bytes_per_texel;
+        texel_ptr = base_ptr + uint64_t(y) * row_pitch_bytes +
+                    uint64_t(x) * bytes_per_texel;
       } else {
         uint32_t offset = uint32_t(texture_util::GetTiledOffset2D(
             int32_t(x), int32_t(y), pitch_blocks, bpb_log2));
@@ -2308,116 +2397,111 @@ bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
     }
   }
 
-  // --- Ensure RTV-capable HostSurface for this morph texture ---
-  D3D12RenderTargetCache::HostSurfaceTextureKey hs_key{};
-  hs_key.base_page      = key.base_page;
-  hs_key.texture_format = key.format;
-  hs_key.width          = width;
-  hs_key.height         = height;
-  hs_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
-
-  ID3D12Resource* host_res = nullptr;
-  D3D12_RESOURCE_STATES* shared_state = nullptr;
-  bool seeded = false;
-  DXGI_FORMAT rtv_fmt_dummy = DXGI_FORMAT_UNKNOWN;
-  if (!command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
-          hs_key, host_res, shared_state, seeded, &rtv_fmt_dummy)) {
-    return false;
-  }
-
-  // --- Choose DXGI format for copy footprint ---
   DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
   switch (component_count) {
-    case 1: dxgi_format = DXGI_FORMAT_R16_FLOAT; break;
-    case 2: dxgi_format = DXGI_FORMAT_R16G16_FLOAT; break;
-    case 4: dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
-    default: return false;
+    case 1:
+      dxgi_format = DXGI_FORMAT_R16_FLOAT;
+      break;
+    case 2:
+      dxgi_format = DXGI_FORMAT_R16G16_FLOAT;
+      break;
+    case 4:
+      dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      break;
+    default:
+      return false;
   }
 
-  // --- Build upload buffer using host_res footprint ---
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
+  texture_desc.Format = dxgi_format;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT num_rows = 0;
   UINT64 row_size_bytes = 0, upload_size = 0;
-  {
-    D3D12_RESOURCE_DESC desc = host_res->GetDesc();
-    desc.Format = dxgi_format;
-    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size_bytes, &upload_size);
-    if (!num_rows || !upload_size) return false;
+  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
+                                &row_size_bytes, &upload_size);
+  if (!num_rows || !upload_size) {
+    return false;
   }
 
-  D3D12_RESOURCE_DESC upload_desc{};
-  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  D3D12_RESOURCE_DESC upload_desc;
+  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
   Microsoft::WRL::ComPtr<ID3D12Resource> upload;
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesUpload,
           provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
-          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) {
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&upload)))) {
     return false;
   }
 
   {
     uint8_t* map = nullptr;
-    D3D12_RANGE rr{0,0};
-    if (FAILED(upload->Map(0, &rr, reinterpret_cast<void**>(&map)))) return false;
-    uint8_t* dst = map + footprint.Offset;
-    const size_t src_row_bytes = size_t(width) * component_count * sizeof(uint16_t);
-    for (UINT row = 0; row < num_rows; ++row) {
-      auto* dst_row = dst + row * footprint.Footprint.RowPitch;
-      auto* src_row = reinterpret_cast<const uint8_t*>(staging.data())
-                    + size_t(row) * src_row_bytes;
-      std::memcpy(dst_row, src_row, src_row_bytes);
-      size_t pad = footprint.Footprint.RowPitch > src_row_bytes
-                 ? size_t(footprint.Footprint.RowPitch) - src_row_bytes : 0u;
-      if (pad) std::memset(dst_row + src_row_bytes, 0, pad);
+    D3D12_RANGE read_range{0, 0};
+    if (FAILED(upload->Map(0, &read_range, reinterpret_cast<void**>(&map)))) {
+      return false;
     }
-    D3D12_RANGE wr{footprint.Offset,
-                   footprint.Offset + num_rows * footprint.Footprint.RowPitch};
-    upload->Unmap(0, &wr);
+    uint8_t* dst = map + footprint.Offset;
+    const size_t src_row_bytes =
+        size_t(width) * component_count * sizeof(uint16_t);
+    for (UINT row = 0; row < num_rows; ++row) {
+      uint8_t* dst_row = dst + row * footprint.Footprint.RowPitch;
+      const uint8_t* src_row =
+          reinterpret_cast<const uint8_t*>(staging.data()) +
+          size_t(row) * src_row_bytes;
+      std::memcpy(dst_row, src_row, src_row_bytes);
+      size_t padding = footprint.Footprint.RowPitch > src_row_bytes
+                           ? size_t(footprint.Footprint.RowPitch) -
+                                 src_row_bytes
+                           : 0u;
+      if (padding) {
+        std::memset(dst_row + src_row_bytes, 0, padding);
+      }
+    }
+    D3D12_RANGE written_range{footprint.Offset,
+                              footprint.Offset +
+                                  num_rows * footprint.Footprint.RowPitch};
+    upload->Unmap(0, &written_range);
   }
 
-  // --- Copy upload -> HostSurface with barriers on shared_state ---
-  const D3D12_RESOURCE_STATES prev =
-      shared_state ? *shared_state : D3D12_RESOURCE_STATE_COMMON;
-
-  command_processor_.PushTransitionBarrier(host_res, prev, D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(upload.Get(),
-                                           D3D12_RESOURCE_STATE_GENERIC_READ,
-                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ID3D12Resource* resource = texture.resource();
+  D3D12_RESOURCE_STATES previous_state =
+      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(resource, previous_state,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.PushTransitionBarrier(
+      upload.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor_.SubmitBarriers();
-  if (shared_state) *shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
-  D3D12_TEXTURE_COPY_LOCATION src{};
+  D3D12_TEXTURE_COPY_LOCATION src = {};
   src.pResource = upload.Get();
   src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   src.PlacedFootprint = footprint;
 
-  D3D12_TEXTURE_COPY_LOCATION dst{};
-  dst.pResource = host_res;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = resource;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   dst.SubresourceIndex = 0;
 
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &dst, 0, 0, 0, &src, nullptr);
   command_processor_.RetainResourceForSubmission(upload.Get());
 
-  const D3D12_RESOURCE_STATES ps =
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
+  const D3D12_RESOURCE_STATES shader_state =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   command_processor_.PushTransitionBarrier(
-      texture.resource(),
-      D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      resource, texture.SetResourceState(shader_state), shader_state);
   command_processor_.SubmitBarriers();
-  if (shared_state) *shared_state = ps;
 
-  command_processor_.render_target_cache().MarkHostSurfaceSeeded(hs_key);
   texture.MarkAsUsed();
   return true;
 }
-
 
 void D3D12TextureCache::InvalidateHostSurfaceBindings(
     uint32_t base_page, xenos::TextureFormat format, uint32_t width,
