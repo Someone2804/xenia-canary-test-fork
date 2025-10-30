@@ -39,7 +39,8 @@ namespace d3d12 {
 
 namespace {
 constexpr bool kDogAlphaUseHighByte = true;
-bool IsPlain16BitFormat(xenos::TextureFormat format) {
+
+static inline bool IsPlain16BitFormat(xenos::TextureFormat format) {
   switch (format) {
     case xenos::TextureFormat::k_16:
     case xenos::TextureFormat::k_16_16:
@@ -50,16 +51,12 @@ bool IsPlain16BitFormat(xenos::TextureFormat format) {
   }
 }
 
-uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
+static inline uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
   switch (format) {
-    case xenos::TextureFormat::k_16:
-      return 1;
-    case xenos::TextureFormat::k_16_16:
-      return 2;
-    case xenos::TextureFormat::k_16_16_16_16:
-      return 4;
-    default:
-      return 0;
+    case xenos::TextureFormat::k_16:                 return 1;
+    case xenos::TextureFormat::k_16_16:              return 2;
+    case xenos::TextureFormat::k_16_16_16_16:        return 4;
+    default:                                         return 0;
   }
 }
 
@@ -67,6 +64,28 @@ static inline bool IsK8888A(xenos::TextureFormat fmt) {
   return fmt == xenos::TextureFormat::k_8_8_8_8_A;
 }
 
+static inline DXGI_FORMAT TypelessForMorph(xenos::TextureFormat f) {
+  if (IsK8888A(f)) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+  switch (GetComponentCountForPlain16Bit(f)) {
+    case 1: return DXGI_FORMAT_R16_TYPELESS;
+    case 2: return DXGI_FORMAT_R16G16_TYPELESS;
+    case 4: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
+// Выбор формата SRV без зависимости от TextureKey
+static inline DXGI_FORMAT SRVForMorph(xenos::TextureFormat fmt, uint32_t signed_mask) {
+  if (IsK8888A(fmt)) {
+    return signed_mask ? DXGI_FORMAT_R8G8B8A8_SNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+  switch (GetComponentCountForPlain16Bit(fmt)) {
+    case 1: return DXGI_FORMAT_R16_FLOAT;
+    case 2: return DXGI_FORMAT_R16G16_FLOAT;
+    case 4: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -1349,64 +1368,44 @@ void D3D12TextureCache::AdjustHostRepackForKey(TextureKey& key) {
 
 std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     TextureKey key) {
-//  if (D3D12RenderTargetCache::IsMorphTextureFormat(key.format) && key.host_repacked) {
-//    D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
-//    surface_key.base_page      = key.base_page;
-//    surface_key.texture_format = key.format;
-//    surface_key.width          = key.GetWidth();
-//    surface_key.height         = key.GetHeight();
-//    surface_key.signed_mask    = static_cast<uint8_t>(key.signed_mask);
-//
-//    ID3D12Resource* host_resource = nullptr;
-//    D3D12_RESOURCE_STATES* shared_state = nullptr;
-//    bool surface_seeded = false;
-//    if (command_processor_.render_target_cache().EnsureHostSurfaceForTexture(
-//            surface_key, host_resource, shared_state, surface_seeded)) {
-//      if (host_resource && shared_state) {
-//        auto tex = std::unique_ptr<Texture>(new D3D12Texture(
-//            *this, key, host_resource, *shared_state, shared_state));
-//
-//        // Seed morph HostSurface on first use so hero/dog are not black at spawn.
-//        const bool is_k8888a = (key.format == xenos::TextureFormat::k_8_8_8_8_A);
-//        const bool is_plain16 = (GetComponentCountForPlain16Bit(key.format) != 0);
-//        if (!surface_seeded) {
-//          if (is_k8888a) {
-//            UploadK8888ATexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
-//          } else if (is_plain16) {
-//            UploadPlain16BitTexture(static_cast<D3D12Texture&>(*tex), /*load_base=*/true, /*load_mips=*/false);
-//          }
-//        }
-//        return tex;
-//      }
-//    }
-//  }
+  D3D12_RESOURCE_DESC desc = {};
 
-  // Fallback legacy path for non-morph formats.
-  D3D12_RESOURCE_DESC desc;
-  desc.Format = GetDXGIResourceFormat(key);
+  // Тип ресурса: для morph-форматов создаём TYPELESS, иначе обычный.
+  if (IsK8888A(key.format) || IsPlain16BitFormat(key.format)) {
+    desc.Format = TypelessForMorph(key.format);
+  } else {
+    desc.Format = GetDXGIResourceFormat(key);
+  }
   if (desc.Format == DXGI_FORMAT_UNKNOWN) {
-    unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
+    unsupported_format_features_used_[uint32_t(key.format)] |=
+        kUnsupportedResourceBit;
     return nullptr;
   }
-  desc.Dimension = (key.dimension == xenos::DataDimension::k3D)
-                       ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                       : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+  // 1D трактуем как 2D.
+  desc.Dimension =
+      (key.dimension == xenos::DataDimension::k3D)
+          ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+          : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Alignment = 0;
   desc.Width = key.GetWidth();
   desc.Height = key.GetHeight();
   if (key.scaled_resolve) {
-    desc.Width  *= draw_resolution_scale_x();
+    desc.Width *= draw_resolution_scale_x();
     desc.Height *= draw_resolution_scale_y();
   }
   desc.DepthOrArraySize = key.GetDepthOrArraySize();
-  desc.MipLevels = key.mip_max_level + 1;
+  desc.MipLevels = static_cast<UINT16>(key.mip_max_level + 1);
   desc.SampleDesc.Count = 1;
   desc.SampleDesc.Quality = 0;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  desc.Flags = D3D12_RESOURCE_FLAG_NONE;  // SRV-only. Никаких RTV для morph.
 
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+
+  // Начальное состояние — под копию из upload-буфера.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -1416,10 +1415,10 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
           IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
-  return std::unique_ptr<Texture>(
+
+  return std::unique_ptr<TextureCache::Texture>(
       new D3D12Texture(*this, key, resource.Get(), resource_state));
 }
-
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_base,
                                                               bool load_mips) {
