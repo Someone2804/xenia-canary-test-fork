@@ -741,10 +741,27 @@ class D3D12TextureCache final : public TextureCache {
 
   static bool IsMorphFormat(const TextureKey& key);
 
+  enum class MorphDiagMode {
+    kDisabled,
+    kTintByAlpha,
+    kAlpha255KeepRgb,
+  };
+
   bool UploadK8888ATexture(D3D12Texture& texture, bool load_base,
                            bool load_mips);
   bool UploadPlain16BitTexture(D3D12Texture& texture, bool load_base,
                                bool load_mips);
+
+  bool DecodeK8888ATextureRGBA(const TextureKey& key,
+                               std::vector<uint8_t>& rgba_out,
+                               MorphDiagMode diag_mode);
+  bool CopyMorphRGBAIntoResource(D3D12Texture& texture,
+                                 const std::vector<uint8_t>& rgba);
+#if MORPH_DIAG
+  bool ApplyMorphDiagnosticOverride(D3D12Texture& texture,
+                                    MorphDiagMode diag_mode);
+  void RecordMorphDiagEvent(const TextureKey& key, bool created, bool bound);
+#endif
 
   LoadShaderIndex GetLoadShaderIndex(TextureKey key) const;
   // chrispy: todo, can use simple branchless tests here
@@ -863,6 +880,39 @@ class D3D12TextureCache final : public TextureCache {
     kUnsupportedSnormBit = kUnsupportedUnormBit << 1,
   };
   uint8_t unsupported_format_features_used_[64];
+
+#if MORPH_DIAG
+  struct MorphDiagKey {
+    uint32_t base_page;
+    uint32_t width;
+    uint32_t height;
+    uint8_t signed_mask;
+    uint8_t tiled;
+
+    bool operator==(const MorphDiagKey& other) const {
+      return base_page == other.base_page && width == other.width &&
+             height == other.height && signed_mask == other.signed_mask &&
+             tiled == other.tiled;
+    }
+  };
+
+  struct MorphDiagKeyHasher {
+    size_t operator()(const MorphDiagKey& key) const {
+      return (size_t(key.base_page) << 32) ^
+             (size_t(key.width) << 16) ^ size_t(key.height) ^
+             (size_t(key.signed_mask) << 8) ^ size_t(key.tiled);
+    }
+  };
+
+  struct MorphDiagCounters {
+    uint32_t srvs_created = 0;
+    uint32_t srvs_bound = 0;
+  };
+
+  std::unordered_map<MorphDiagKey, MorphDiagCounters, MorphDiagKeyHasher>
+      morph_diag_frame_counters_;
+  bool morph_diag_dump_written_ = false;
+#endif
 
   // The tiled buffer for resolved data with resolution scaling.
   // Because on Direct3D 12 (at least on Windows 10 2004) typed SRV or UAV

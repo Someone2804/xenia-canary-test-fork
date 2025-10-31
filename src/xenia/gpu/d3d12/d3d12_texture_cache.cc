@@ -13,13 +13,17 @@
 #include <array>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <DirectXPackedVector.h>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
@@ -44,6 +48,12 @@ constexpr bool kDogAlphaUseHighByte = true;
 // -----------------------------------------------------------------------------
 // Morph sanity toggles (compile-time only, no runtime branching required).
 // -----------------------------------------------------------------------------
+#define MORPH_DIAG 0
+#if MORPH_DIAG
+// true -> tint red/blue based on alpha high byte, false -> keep RGB, force A=255.
+constexpr bool kMorphDiagTintMode = true;
+#include "third_party/stb/stb_image_write.h"
+#endif
 // SANITY #1: overwrite the decoded result with solid red to confirm that
 // UploadK8888ATexture is invoked and its output reaches the shader. Set to 1
 // only for local debugging builds.
@@ -71,6 +81,10 @@ constexpr bool IsPlain16Bit(xenos::TextureFormat format) {
   using TF = xenos::TextureFormat;
   return format == TF::k_16 || format == TF::k_16_16 ||
          format == TF::k_16_16_16_16;
+}
+
+constexpr bool IsMorphTextureFormat(xenos::TextureFormat format) {
+  return IsK8888A(format) || IsPlain16Bit(format);
 }
 
 constexpr uint32_t GetComponentCountForPlain16Bit(xenos::TextureFormat format) {
@@ -522,6 +536,9 @@ void D3D12TextureCache::BeginFrame() {
 
   std::memset(unsupported_format_features_used_, 0,
               sizeof(unsupported_format_features_used_));
+#if MORPH_DIAG
+  morph_diag_frame_counters_.clear();
+#endif
 }
 
 void D3D12TextureCache::EndFrame() {
@@ -542,6 +559,19 @@ void D3D12TextureCache::EndFrame() {
            unsupported_features & kUnsupportedSnormBit ? " signed" : "");
     unsupported_format_features_used_[i] = 0;
   }
+#if MORPH_DIAG
+  if (!morph_diag_frame_counters_.empty()) {
+    XELOGI("[MorphDiag] Frame morph SRV stats:");
+    for (const auto& entry : morph_diag_frame_counters_) {
+      const MorphDiagKey& key = entry.first;
+      const MorphDiagCounters& counters = entry.second;
+      XELOGI(
+          "  base=%08X size=%ux%u signed=%u tiled=%u created=%u bound=%u",
+          key.base_page, key.width, key.height, key.signed_mask, key.tiled,
+          counters.srvs_created, counters.srvs_bound);
+    }
+  }
+#endif
 }
 
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -674,6 +704,9 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   if (descriptor_index != UINT32_MAX) {
     assert_not_null(texture);
     texture->MarkAsUsed();
+#if MORPH_DIAG
+    RecordMorphDiagEvent(binding->key, false, true);
+#endif
     source_handle = GetTextureDescriptorCPUHandle(descriptor_index);
   } else {
     NullSRVDescriptorIndex null_descriptor_index;
@@ -719,6 +752,11 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
     descriptor_index = host_shader_binding.is_signed
                            ? d3d12_binding.descriptor_index_signed
                            : d3d12_binding.descriptor_index;
+#if MORPH_DIAG
+    if (descriptor_index != UINT32_MAX) {
+      RecordMorphDiagEvent(binding->key, false, true);
+    }
+#endif
   }
   if (descriptor_index == UINT32_MAX) {
     switch (host_shader_binding.dimension) {
@@ -1358,10 +1396,6 @@ void D3D12TextureCache::AdjustHostRepackForKey(TextureKey& key) {
   TextureCache::AdjustHostRepackForKey(key);
 }
 
-bool D3D12TextureCache::IsMorphFormat(const TextureKey& key) {
-  return IsK8888A(key.format) || IsPlain16Bit(key.format);
-}
-
 std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     TextureKey key) {
 #if K8888A_FORCE_GREY
@@ -1481,7 +1515,7 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
   }
 #endif  // K8888A_FORCE_GREY
 
-  if (IsMorphFormat(key)) {
+  if (IsMorphTextureFormat(key.format)) {
     D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
     surface_key.base_page = key.base_page;
     surface_key.texture_format = key.format;
@@ -1575,7 +1609,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
-  if (IsMorphFormat(texture_key)) {
+  if (IsMorphTextureFormat(texture_key.format)) {
     D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
     surface_key.base_page = texture_key.base_page;
     surface_key.texture_format = texture_key.format;
@@ -2104,7 +2138,7 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
     return UINT32_MAX;
   }
   xenos::TextureFormat format = texture_key.format;
-  if (IsMorphFormat(texture_key)) {
+  if (IsMorphTextureFormat(texture_key.format)) {
     if (IsK8888A(texture_key.format)) {
       desc.Format = use_signed_view ? DXGI_FORMAT_R8G8B8A8_SNORM
                                     : DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2143,7 +2177,7 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
   }
 
 #if XE_FABLE2_TRACE_MORPH
-  if (IsMorphFormat(texture_key)) {
+  if (IsMorphTextureFormat(texture_key.format)) {
     uint64_t log_hash = (uint64_t(texture_key.base_page) << 32) ^
                         (uint64_t(desc.Format) << 8) ^
                         uint64_t(descriptor_key.host_swizzle) ^
@@ -2166,7 +2200,7 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
       desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
       desc.Texture2DArray.MostDetailedMip = 0;
       desc.Texture2DArray.MipLevels =
-          IsMorphFormat(texture_key) ? 1 : mip_levels;
+          IsMorphTextureFormat(texture_key.format) ? 1 : mip_levels;
       desc.Texture2DArray.FirstArraySlice = 0;
       desc.Texture2DArray.ArraySize = texture_key.GetDepthOrArraySize();
       desc.Texture2DArray.PlaneSlice = 0;
@@ -2175,13 +2209,15 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
     case xenos::DataDimension::k3D:
       desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
       desc.Texture3D.MostDetailedMip = 0;
-      desc.Texture3D.MipLevels = IsMorphFormat(texture_key) ? 1 : mip_levels;
+      desc.Texture3D.MipLevels =
+          IsMorphTextureFormat(texture_key.format) ? 1 : mip_levels;
       desc.Texture3D.ResourceMinLODClamp = 0.0f;
       break;
     case xenos::DataDimension::kCube:
       desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
       desc.TextureCube.MostDetailedMip = 0;
-      desc.TextureCube.MipLevels = IsMorphFormat(texture_key) ? 1 : mip_levels;
+      desc.TextureCube.MipLevels =
+          IsMorphTextureFormat(texture_key.format) ? 1 : mip_levels;
       desc.TextureCube.ResourceMinLODClamp = 0.0f;
       break;
     default:
@@ -2258,6 +2294,18 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
 
   D3D12_CPU_DESCRIPTOR_HANDLE target_handle =
       GetTextureDescriptorCPUHandle(descriptor_index);
+
+#if MORPH_DIAG
+  if (texture_key.format == xenos::TextureFormat::k_8_8_8_8_A) {
+    MorphDiagMode diag_mode = kMorphDiagTintMode
+                                  ? MorphDiagMode::kTintByAlpha
+                                  : MorphDiagMode::kAlpha255KeepRgb;
+    if (!ApplyMorphDiagnosticOverride(texture, diag_mode)) {
+      XELOGE("[MorphDiag] Failed to apply diagnostic override for base=%08X",
+             texture_key.base_page);
+    }
+  }
+#endif
 
 #if DEBUG_FORCE_NEUTRAL_NORMAL
   auto IsPlain16BitSRVFormat = [](DXGI_FORMAT format) {
@@ -2394,6 +2442,9 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
       device->CreateShaderResourceView(neutral_texture, &neutral_desc,
                                        target_handle);
       texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
+#if MORPH_DIAG
+      RecordMorphDiagEvent(texture_key, true, false);
+#endif
       return descriptor_index;
     }
   }
@@ -2401,6 +2452,9 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(
 
   device->CreateShaderResourceView(texture.resource(), &desc, target_handle);
   texture.AddSRVDescriptorIndex(descriptor_key, descriptor_index);
+#if MORPH_DIAG
+  RecordMorphDiagEvent(texture_key, true, false);
+#endif
   return descriptor_index;
 }
 
@@ -2444,22 +2498,174 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(
   return clamp_mode;
 }
 
-bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
-                                            bool load_base,
-                                            bool /*load_mips*/) {
-  if (!load_base) {
-    return true;
-  }
-
-  const TextureKey& key = texture.key();
+bool D3D12TextureCache::DecodeK8888ATextureRGBA(const TextureKey& key,
+                                                std::vector<uint8_t>& rgba_out,
+                                                MorphDiagMode diag_mode) {
   uint32_t width = key.GetWidth();
   uint32_t height = key.GetHeight();
   if (!width || !height) {
     return false;
   }
 
+  const uint64_t pixel_count = uint64_t(width) * uint64_t(height);
+#if !MORPH_DIAG
+  (void)diag_mode;
+#endif
+#if XE_FABLE2_SOLID_COLOR
+  rgba_out.assign(pixel_count * 4u, 0);
+  for (uint64_t i = 0; i < pixel_count; ++i) {
+    rgba_out[i * 4 + 0] = 255;
+    rgba_out[i * 4 + 1] = 0;
+    rgba_out[i * 4 + 2] = 0;
+    rgba_out[i * 4 + 3] = 255;
+  }
+  return true;
+#else
+  const uint64_t alpha_plane_size = pixel_count * 2u;
+  const uint64_t rgb_plane_size = pixel_count * 3u;
+  const uint64_t total_size = alpha_plane_size + rgb_plane_size;
+  if (!alpha_plane_size || !rgb_plane_size || total_size > UINT32_MAX) {
+    return false;
+  }
+
+  const uint32_t base_address = key.base_page << 12;
+  const uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
+  if (uint64_t(base_address) > buffer_size_bytes || total_size > buffer_size_bytes ||
+      uint64_t(base_address) + total_size > buffer_size_bytes) {
+    return false;
+  }
+
+  if (!shared_memory().RequestRange(
+          base_address, xe::align(uint32_t(total_size), uint32_t(16)),
+          nullptr)) {
+    return false;
+  }
+
+  const auto& d3d12_shared_memory =
+      static_cast<const D3D12SharedMemory&>(shared_memory());
+  const uint8_t* alpha_src =
+      d3d12_shared_memory.TranslatePhysical(base_address);
+  if (!alpha_src) {
+    return false;
+  }
+  const uint8_t* rgb_src = d3d12_shared_memory.TranslatePhysical(
+      base_address + uint32_t(alpha_plane_size));
+  if (!rgb_src) {
+    return false;
+  }
+
+  rgba_out.resize(pixel_count * 4u);
+  using xe::gpu::texture_util::GetTiledOffset2D;
+
+  if (!key.tiled) {
+    for (uint64_t i = 0; i < pixel_count; ++i) {
+      uint16_t a16;
+      std::memcpy(&a16, alpha_src + i * 2u, sizeof(a16));
+      a16 = xenos::GpuSwap(a16, key.endianness);
+      const uint8_t alpha_high = uint8_t(a16 >> 8);
+      const uint8_t alpha_low = uint8_t(a16 & 0xFF);
+      uint8_t a8 = kDogAlphaUseHighByte ? alpha_high : alpha_low;
+
+      const uint8_t* rgb = rgb_src + i * 3u;
+      uint8_t r = rgb[2];
+      uint8_t g = rgb[1];
+      uint8_t b = rgb[0];
+#if XENIA_MORPH_FORCE_ALPHA_255
+      a8 = 255;
+#endif
+#if XENIA_MORPH_SWAP_RB
+      std::swap(r, b);
+#endif
+#if MORPH_DIAG
+      if (diag_mode == MorphDiagMode::kTintByAlpha) {
+        const bool high = alpha_high >= 0x80;
+        r = high ? 255 : 0;
+        g = 0;
+        b = high ? 0 : 255;
+        a8 = 255;
+      } else if (diag_mode == MorphDiagMode::kAlpha255KeepRgb) {
+        a8 = 255;
+      }
+#else
+      (void)diag_mode;
+#endif
+
+      const uint64_t dst = i * 4u;
+      rgba_out[dst + 0] = r;
+      rgba_out[dst + 1] = g;
+      rgba_out[dst + 2] = b;
+      rgba_out[dst + 3] = a8;
+    }
+  } else {
+    const uint32_t pitch_blocks_rgb = width;
+    const uint32_t pitch_blocks_alpha = width;
+    constexpr uint32_t bpb_log2_rgb = 2;
+    constexpr uint32_t bpb_log2_alpha = 1;
+
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint32_t a_off = static_cast<uint32_t>(GetTiledOffset2D(
+            int32_t(x), int32_t(y), pitch_blocks_alpha, bpb_log2_alpha));
+        uint16_t a16;
+        std::memcpy(&a16, alpha_src + a_off, sizeof(a16));
+        a16 = xenos::GpuSwap(a16, key.endianness);
+        const uint8_t alpha_high = uint8_t(a16 >> 8);
+        const uint8_t alpha_low = uint8_t(a16 & 0xFF);
+        uint8_t a8 = kDogAlphaUseHighByte ? alpha_high : alpha_low;
+
+        const uint32_t rgb_off = static_cast<uint32_t>(GetTiledOffset2D(
+            int32_t(x), int32_t(y), pitch_blocks_rgb, bpb_log2_rgb));
+        const uint8_t* rgbp = rgb_src + rgb_off;
+        uint8_t r = rgbp[2];
+        uint8_t g = rgbp[1];
+        uint8_t b = rgbp[0];
+#if XENIA_MORPH_FORCE_ALPHA_255
+        a8 = 255;
+#endif
+#if XENIA_MORPH_SWAP_RB
+        std::swap(r, b);
+#endif
+#if MORPH_DIAG
+        if (diag_mode == MorphDiagMode::kTintByAlpha) {
+          const bool high = alpha_high >= 0x80;
+          r = high ? 255 : 0;
+          g = 0;
+          b = high ? 0 : 255;
+          a8 = 255;
+        } else if (diag_mode == MorphDiagMode::kAlpha255KeepRgb) {
+          a8 = 255;
+        }
+#endif
+
+        const size_t dst = (size_t(y) * width + x) * 4u;
+        rgba_out[dst + 0] = r;
+        rgba_out[dst + 1] = g;
+        rgba_out[dst + 2] = b;
+        rgba_out[dst + 3] = a8;
+      }
+    }
+  }
+
+  return true;
+#endif  // XE_FABLE2_SOLID_COLOR
+}
+
+bool D3D12TextureCache::CopyMorphRGBAIntoResource(
+    D3D12Texture& texture, const std::vector<uint8_t>& rgba) {
+  const TextureKey& key = texture.key();
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  if (!width || !height) {
+    return false;
+  }
+  const size_t expected_size = size_t(width) * size_t(height) * 4u;
+  if (rgba.size() != expected_size) {
+    return false;
+  }
+
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+
   D3D12RenderTargetCache::HostSurfaceTextureKey surface_key;
   surface_key.base_page = key.base_page;
   surface_key.texture_format = key.format;
@@ -2467,21 +2673,20 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   surface_key.height = height;
   surface_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
 
-#if XENIA_MORPH_EARLY_RED
-  // SANITY #1: upload solid red to ensure this path feeds the shader.
   D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
   texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
   UINT num_rows = 0;
-  UINT64 row_size_bytes = 0, upload_size = 0;
+  UINT64 row_size_bytes = 0;
+  UINT64 upload_size = 0;
   device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
                                 &row_size_bytes, &upload_size);
   if (!num_rows || !upload_size) {
     return false;
   }
 
-  D3D12_RESOURCE_DESC upload_desc;
+  D3D12_RESOURCE_DESC upload_desc{};
   ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
                                           D3D12_RESOURCE_FLAG_NONE);
   Microsoft::WRL::ComPtr<ID3D12Resource> upload;
@@ -2499,21 +2704,16 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
       return false;
     }
     uint8_t* dst = map + footprint.Offset;
-    std::vector<uint8_t> row(size_t(width) * 4u, 0);
-    for (size_t px = 0; px < size_t(width); ++px) {
-      row[px * 4 + 0] = 0;
-      row[px * 4 + 1] = 0;
-      row[px * 4 + 2] = 255;
-      row[px * 4 + 3] = 255;
-    }
-    for (UINT row_index = 0; row_index < num_rows; ++row_index) {
-      uint8_t* dst_row = dst + row_index * footprint.Footprint.RowPitch;
-      std::memcpy(dst_row, row.data(), row.size());
-      size_t padding = footprint.Footprint.RowPitch > row.size()
-                           ? size_t(footprint.Footprint.RowPitch) - row.size()
-                           : 0u;
+    const size_t src_row_bytes = size_t(width) * 4u;
+    for (UINT row = 0; row < num_rows; ++row) {
+      uint8_t* dst_row = dst + row * footprint.Footprint.RowPitch;
+      const uint8_t* src_row = rgba.data() + size_t(row) * src_row_bytes;
+      std::memcpy(dst_row, src_row, src_row_bytes);
+      const size_t padding = footprint.Footprint.RowPitch > src_row_bytes
+                                 ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
+                                 : 0u;
       if (padding) {
-        std::memset(dst_row + row.size(), 0, padding);
+        std::memset(dst_row + src_row_bytes, 0, padding);
       }
     }
     D3D12_RANGE written_range{footprint.Offset,
@@ -2565,208 +2765,107 @@ bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
   texture.MarkAsUsed();
   command_processor_.render_target_cache().MarkHostSurfaceSeeded(surface_key);
   return true;
-#endif  // XENIA_MORPH_EARLY_RED
+}
 
-#if XE_FABLE2_SOLID_COLOR
-  const uint64_t pixel_count = uint64_t(width) * uint64_t(height);
-  std::vector<uint8_t> rgba(pixel_count * 4u);
-  for (uint64_t i = 0; i < pixel_count; ++i) {
-    rgba[i * 4 + 0] = 255;
-    rgba[i * 4 + 1] = 0;
-    rgba[i * 4 + 2] = 0;
-    rgba[i * 4 + 3] = 255;
+bool D3D12TextureCache::UploadK8888ATexture(D3D12Texture& texture,
+                                            bool load_base,
+                                            bool /*load_mips*/) {
+  if (!load_base) {
+    return true;
   }
+
+  const TextureKey& key = texture.key();
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  if (!width || !height) {
+    return false;
+  }
+
+#if XENIA_MORPH_EARLY_RED
+  std::vector<uint8_t> solid(size_t(width) * size_t(height) * 4u, 0);
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      size_t idx = (size_t(y) * width + x) * 4u;
+      solid[idx + 0] = 255;
+      solid[idx + 1] = 0;
+      solid[idx + 2] = 0;
+      solid[idx + 3] = 255;
+    }
+  }
+  return CopyMorphRGBAIntoResource(texture, solid);
 #else
-  // Read guest morph planes. Alpha stored as 16-bit, RGB as 24-bit.
-  uint64_t pixel_count = uint64_t(width) * uint64_t(height);
-  uint64_t alpha_plane_size = pixel_count * 2u;
-  uint64_t rgb_plane_size = pixel_count * 3u;
-  uint64_t total_size = alpha_plane_size + rgb_plane_size;
-  if (!alpha_plane_size || !rgb_plane_size || total_size > UINT32_MAX) {
+  std::vector<uint8_t> rgba;
+  if (!DecodeK8888ATextureRGBA(key, rgba, MorphDiagMode::kDisabled)) {
     return false;
   }
-
-  uint32_t base_address = key.base_page << 12;
-  uint64_t buffer_size_bytes = uint64_t(SharedMemory::kBufferSize);
-  if (uint64_t(base_address) > buffer_size_bytes ||
-      total_size > buffer_size_bytes ||
-      uint64_t(base_address) + total_size > buffer_size_bytes) {
-    return false;
-  }
-
-  if (!shared_memory().RequestRange(
-          base_address, xe::align(uint32_t(total_size), uint32_t(16)),
-          nullptr)) {
-    return false;
-  }
-  const auto& d3d12_shared_memory =
-      static_cast<const D3D12SharedMemory&>(shared_memory());
-  const uint8_t* alpha_src =
-      d3d12_shared_memory.TranslatePhysical(base_address);
-  if (!alpha_src) {
-    return false;
-  }
-  const uint8_t* rgb_src = d3d12_shared_memory.TranslatePhysical(
-      base_address + uint32_t(alpha_plane_size));
-  if (!rgb_src) {
-    return false;
-  }
-  using xe::gpu::texture_util::GetTiledOffset2D;
-  std::vector<uint8_t> rgba(pixel_count * 4u);
-
-  if (!key.tiled) {
-    // Linear layout: iterate sequentially, convert guest BGR to RGB, and use
-    // the selected alpha byte.
-    for (uint64_t i = 0; i < pixel_count; ++i) {
-      uint16_t a16;
-      std::memcpy(&a16, alpha_src + i * 2u, sizeof(a16));
-      a16 = xenos::GpuSwap(a16, key.endianness);
-      uint8_t a8 =
-          kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
-
-      const uint8_t* rgb = rgb_src + i * 3u;
-      uint8_t r = rgb[2];
-      uint8_t g = rgb[1];
-      uint8_t b = rgb[0];
-#if XENIA_MORPH_FORCE_ALPHA_255
-      // SANITY #2: override alpha to diagnose alpha plane issues.
-      a8 = 255;
+  return CopyMorphRGBAIntoResource(texture, rgba);
 #endif
-#if XENIA_MORPH_SWAP_RB
-      std::swap(r, b);
-#endif
-      uint64_t dst = i * 4u;
-      rgba[dst + 0] = r;
-      rgba[dst + 1] = g;
-      rgba[dst + 2] = b;
-      rgba[dst + 3] = a8;
-    }
-  } else {
-    // MORPH DECODE TILED: treat the RGB plane as 4 bytes per texel (32bpp
-    // tiles) and the alpha plane as 2 bytes per texel.
-    const uint32_t pitch_blocks_rgb = width;    // 4 bytes per texel => log2 = 2
-    const uint32_t pitch_blocks_alpha = width;  // 2 bytes per texel => log2 = 1
-    const uint32_t bpb_log2_rgb = 2;
-    const uint32_t bpb_log2_alpha = 1;
+}
 
-    for (uint32_t y = 0; y < height; ++y) {
-      for (uint32_t x = 0; x < width; ++x) {
-        // Alpha comes from the first plane (16-bit per texel).
-        uint32_t a_off = static_cast<uint32_t>(GetTiledOffset2D(
-            int32_t(x), int32_t(y), pitch_blocks_alpha, bpb_log2_alpha));
-        uint16_t a16;
-        std::memcpy(&a16, alpha_src + a_off, sizeof(a16));
-        a16 = xenos::GpuSwap(a16, key.endianness);
-        uint8_t a8 =
-            kDogAlphaUseHighByte ? uint8_t(a16 >> 8) : uint8_t(a16 & 0xFF);
+#if MORPH_DIAG
+bool D3D12TextureCache::ApplyMorphDiagnosticOverride(
+    D3D12Texture& texture, MorphDiagMode diag_mode) {
+  const TextureKey& key = texture.key();
+  if (key.format != xenos::TextureFormat::k_8_8_8_8_A) {
+    return true;
+  }
 
-        // RGB comes from the second plane, assuming 4 bytes per texel tiles.
-        uint32_t rgb_off = static_cast<uint32_t>(GetTiledOffset2D(
-            int32_t(x), int32_t(y), pitch_blocks_rgb, bpb_log2_rgb));
-        const uint8_t* rgbp = rgb_src + rgb_off;
-        uint8_t r = rgbp[2];
-        uint8_t g = rgbp[1];
-        uint8_t b = rgbp[0];
-#if XENIA_MORPH_FORCE_ALPHA_255
-        // SANITY #2: override alpha to diagnose alpha plane issues.
-        a8 = 255;
-#endif
-#if XENIA_MORPH_SWAP_RB
-        std::swap(r, b);
-#endif
+  std::vector<uint8_t> rgba;
+  if (!DecodeK8888ATextureRGBA(key, rgba, diag_mode)) {
+    return false;
+  }
 
-        size_t dst = (size_t(y) * width + x) * 4u;
-        rgba[dst + 0] = r;
-        rgba[dst + 1] = g;
-        rgba[dst + 2] = b;
-        rgba[dst + 3] = a8;
+  if (!CopyMorphRGBAIntoResource(texture, rgba)) {
+    return false;
+  }
+
+  if (!morph_diag_dump_written_) {
+    const auto dump_root = xe::filesystem::GetUserFolder() / "dump";
+    xe::filesystem::CreateFolder(dump_root);
+    const auto dump_path = dump_root / "morph_diag_k8888a.png";
+    FILE* file = xe::filesystem::OpenFile(dump_path, "wb");
+    if (file) {
+      auto callback = [](void* context, void* data, int size) {
+        fwrite(data, 1, size, static_cast<FILE*>(context));
+      };
+      const int width = static_cast<int>(key.GetWidth());
+      const int height = static_cast<int>(key.GetHeight());
+      const int stride = width * 4;
+      if (stbi_write_png_to_func(callback, file, width, height, 4, rgba.data(),
+                                 stride)) {
+        XELOGI("[MorphDiag] Dumped first k_8_8_8_8_A texture to %s",
+               xe::path_to_utf8(dump_path).c_str());
+        morph_diag_dump_written_ = true;
       }
+      fclose(file);
     }
   }
-#endif  // XE_FABLE2_SOLID_COLOR
-  D3D12_RESOURCE_DESC texture_desc = texture.resource()->GetDesc();
-  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-  UINT num_rows = 0;
-  UINT64 row_size_bytes = 0, upload_size = 0;
-  device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, &num_rows,
-                                &row_size_bytes, &upload_size);
-  if (!num_rows || !upload_size) {
-    return false;
-  }
-
-  D3D12_RESOURCE_DESC upload_desc;
-  ui::d3d12::util::FillBufferResourceDesc(upload_desc, upload_size,
-                                          D3D12_RESOURCE_FLAG_NONE);
-  Microsoft::WRL::ComPtr<ID3D12Resource> upload;
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesUpload,
-          provider.GetHeapFlagCreateNotZeroed(), &upload_desc,
-          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)))) {
-    return false;
-  }
-
-  {
-    uint8_t* map = nullptr;
-    D3D12_RANGE read_range{0, 0};
-    if (FAILED(upload->Map(0, &read_range, reinterpret_cast<void**>(&map)))) {
-      return false;
-    }
-    uint8_t* dst = map + footprint.Offset;
-    const size_t src_row_bytes = size_t(width) * 4u;
-    for (UINT row = 0; row < num_rows; ++row) {
-      uint8_t* dst_row = dst + row * footprint.Footprint.RowPitch;
-      const uint8_t* src_row = rgba.data() + size_t(row) * src_row_bytes;
-      std::memcpy(dst_row, src_row, src_row_bytes);
-      size_t padding = footprint.Footprint.RowPitch > src_row_bytes
-                           ? size_t(footprint.Footprint.RowPitch) - src_row_bytes
-                           : 0u;
-      if (padding) {
-        std::memset(dst_row + src_row_bytes, 0, padding);
-      }
-    }
-    D3D12_RANGE written_range{footprint.Offset,
-                              footprint.Offset +
-                                  num_rows * footprint.Footprint.RowPitch};
-    upload->Unmap(0, &written_range);
-  }
-
-  ID3D12Resource* resource = texture.resource();
-  D3D12_RESOURCE_STATES previous_state =
-      texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(resource, previous_state,
-                                           D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.PushTransitionBarrier(
-      upload.Get(), D3D12_RESOURCE_STATE_GENERIC_READ,
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
-
-  D3D12_TEXTURE_COPY_LOCATION src = {};
-  src.pResource = upload.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint = footprint;
-
-  D3D12_TEXTURE_COPY_LOCATION dst = {};
-  dst.pResource = resource;
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-      &dst, 0, 0, 0, &src, nullptr);
-  command_processor_.RetainResourceForSubmission(upload.Get());
-
-  const D3D12_RESOURCE_STATES shader_state =
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-  command_processor_.PushTransitionBarrier(
-      resource, texture.SetResourceState(shader_state), shader_state);
-  command_processor_.SubmitBarriers();
-
-  texture.MarkAsUsed();
-  command_processor_.render_target_cache().MarkHostSurfaceSeeded(surface_key);
   return true;
 }
+
+void D3D12TextureCache::RecordMorphDiagEvent(const TextureKey& key, bool created,
+                                             bool bound) {
+  if (key.format != xenos::TextureFormat::k_8_8_8_8_A) {
+    return;
+  }
+
+  MorphDiagKey diag_key;
+  diag_key.base_page = key.base_page;
+  diag_key.width = key.GetWidth();
+  diag_key.height = key.GetHeight();
+  diag_key.signed_mask = static_cast<uint8_t>(key.signed_mask);
+  diag_key.tiled = key.tiled ? 1u : 0u;
+
+  MorphDiagCounters& counters = morph_diag_frame_counters_[diag_key];
+  if (created) {
+    ++counters.srvs_created;
+  }
+  if (bound) {
+    ++counters.srvs_bound;
+  }
+}
+#endif  // MORPH_DIAG
 
 bool D3D12TextureCache::UploadPlain16BitTexture(D3D12Texture& texture,
                                                 bool load_base,
